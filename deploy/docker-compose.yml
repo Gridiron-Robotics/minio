@@ -55,6 +55,12 @@ services:
     depends_on:
       minio:
         condition: service_healthy
+    # Load .env so the per-module S3_KEY_<MODULE>/S3_SECRET_<MODULE> pairs reach
+    # bootstrap.sh without enumerating each here (it mints one scoped svcacct per
+    # module that has a pair). Optional file — absent in a bare checkout.
+    env_file:
+      - path: .env
+        required: false
     environment:
       MINIO_ENDPOINT: "http://minio:9000"
       MINIO_ROOT_USER: ${MINIO_ROOT_USER:?}
