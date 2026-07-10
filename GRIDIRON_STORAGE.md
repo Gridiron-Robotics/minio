@@ -52,6 +52,37 @@ curl -s -H "Authorization: Bearer $MINIO_MCP_TOKEN" http://localhost:8090/tools?
 ## Registration (consumer side, separate repos)
 - **langgraph-agents** `docker-compose.real.yml` / `ADAPTER_ROUTES`:
   `{ "kind": "contract", "url": "http://minio-mcp:8090", "server": "minio" }`
-  (+ a `GATEWAY_TOKENS[minio-mcp]` entry matching `MINIO_MCP_TOKEN`).
-- **Erp** composition root: add `deploy/docker-compose.yml` as a core-spine
-  overlay (storage underpins every module).
+  (+ a `GATEWAY_TOKENS[minio-mcp]` entry matching `MINIO_MCP_TOKEN`). Registered
+  as gateway §26 (`storage-gateway:4025`) — DONE.
+- **Erp** composition root: `compose/storage.yml` overlay `include:`s
+  `deploy/docker-compose.yml` (storage underpins every module) — DONE.
+
+## Migrating a consumer off AWS S3
+
+Almost every consumer already speaks S3 through the AWS SDK / a storage library
+that exposes an **endpoint override + path-style flag** — so the migration is a
+config change, not a code change. Point the module at the internal store:
+
+| Setting | Value |
+|---|---|
+| Endpoint | `http://minio:9000` (container-name on `erp_shared_network`) |
+| Force path-style | `true` (MinIO needs path-style, not virtual-host buckets) |
+| Region | `us-east-1` (MinIO's default; any value works if the client insists) |
+| TLS | off in-cluster (`http://`); terminate at the ingress for external clients |
+| Access / secret key | the module's scoped pair — `S3_KEY_<MODULE>` / `S3_SECRET_<MODULE>` from `deploy/.env` (bootstrap mints a svcacct scoped to `t-*-<module>`) |
+| Bucket | `t-<tenant>-<module>` (single-tenant demo: `t-default-<module>`) |
+
+Each module gets a service account that can touch **only its own buckets**
+across all tenants (`t-*-<module>`); it cannot read another module's blobs.
+Modules that need broader reach can fall back to the `gridiron-storage` account
+(all `t-*`), but prefer the scoped one.
+
+The bucket already exists if the module is in `BOOTSTRAP_MODULES`; otherwise add
+it there (and a `S3_KEY_/S3_SECRET_` pair) and re-run bootstrap — it's
+idempotent.
+
+If a consumer's S3 client is **hardcoded to AWS with no endpoint override**, add
+the override (SDK v3: `endpoint` + `forcePathStyle`; boto3: `endpoint_url` +
+`s3={'addressing_style':'path'}`; Rails ActiveStorage: `endpoint:` +
+`force_path_style: true` on the `:amazon`/`:s3` service) — a few lines, no logic
+change.

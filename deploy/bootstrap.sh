@@ -41,4 +41,40 @@ mc admin user svcacct add gr "$MINIO_ROOT_USER" \
   --policy /tmp/mcp-policy.json 2>/dev/null || \
   echo "    (mcp service account already exists — leaving as-is)"
 
+# 4. Per-module service accounts — how a module talks S3 DIRECTLY to the store
+#    (not via the MCP sidecar). Each gets keys scoped to ONLY its own buckets
+#    across every tenant (t-*-<module>), so a compromised module can never read
+#    another module's blobs. Keys are supplied per module via env
+#    S3_KEY_<MODULE> / S3_SECRET_<MODULE> (module upper-cased, '-'→'_'), so they
+#    live in Infisical, not the repo. Modules without a dedicated pair are simply
+#    skipped (their consumer can fall back to the broad gridiron-storage account).
+echo "==> per-module service accounts (scoped to t-*-<module>)"
+for m in $BOOTSTRAP_MODULES; do
+  mu="$(printf '%s' "$m" | tr '[:lower:]-' '[:upper:]_')"
+  akey="$(printenv "S3_KEY_${mu}" 2>/dev/null || true)"
+  skey="$(printenv "S3_SECRET_${mu}" 2>/dev/null || true)"
+  if [ -z "$akey" ] || [ -z "$skey" ]; then
+    echo "    ${m}: no S3_KEY_${mu}/S3_SECRET_${mu} — skipped (uses shared gridiron-storage)"
+    continue
+  fi
+  pol="/tmp/mod-${m}-policy.json"
+  cat >"$pol" <<JSON
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    { "Effect": "Allow",
+      "Action": ["s3:*"],
+      "Resource": ["arn:aws:s3:::t-*-${m}", "arn:aws:s3:::t-*-${m}/*"] }
+  ]
+}
+JSON
+  mc admin policy create gr "gridiron-storage-${m}" "$pol" 2>/dev/null || true
+  if mc admin user svcacct add gr "$MINIO_ROOT_USER" \
+       --access-key "$akey" --secret-key "$skey" --policy "$pol" 2>/dev/null; then
+    echo "    ${m}: svcacct ${akey} scoped to t-*-${m}"
+  else
+    echo "    ${m}: svcacct already exists — leaving as-is"
+  fi
+done
+
 echo "bootstrap complete."
