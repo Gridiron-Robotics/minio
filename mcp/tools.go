@@ -33,36 +33,63 @@ type toolDef struct {
 	Handler     toolHandler
 }
 
-// segRe validates a tenant/module segment used to build a bucket name.
-var segRe = regexp.MustCompile(`[^a-z0-9-]`)
+// segOK matches an already-canonical tenant/module segment: lowercase
+// alphanumerics and interior dashes only, no leading or trailing dash.
+var segOK = regexp.MustCompile(`^[a-z0-9]([a-z0-9-]*[a-z0-9])?$`)
 
-// sanitizeSegment lower-cases and strips anything not valid in an S3 bucket
-// segment, so a hostile tenant/module value can't inject a path or a foreign
-// bucket name.
-func sanitizeSegment(s string) string {
+// canonicalSegment normalises case and surrounding whitespace, then REJECTS
+// anything that is not already a valid segment. It deliberately does not
+// rewrite bad input into good input.
+//
+// The previous version substituted every invalid character with a dash and
+// then trimmed leading/trailing dashes, which silently collapsed hostile input
+// onto a DIFFERENT, legitimate tenant: "../globex", "..globex", "/globex/" and
+// "___globex" all became exactly "globex". Anything able to influence the
+// tenant segment could therefore address another tenant's buckets while
+// looking perfectly well-formed. Mangling input into a valid-but-different
+// identity is the failure mode; refusing it is the fix.
+func canonicalSegment(s string) (string, bool) {
 	s = strings.ToLower(strings.TrimSpace(s))
-	s = segRe.ReplaceAllString(s, "-")
-	s = strings.Trim(s, "-")
-	if len(s) > 40 {
-		s = s[:40]
+	if s == "" || len(s) > 40 || !segOK.MatchString(s) {
+		return "", false
 	}
-	return s
+	return s, true
+}
+
+// sanitizeSegment returns the canonical form, or "" when the input is not a
+// valid segment. Callers MUST treat "" as a rejection — it never silently
+// rewrites one identity into another.
+func sanitizeSegment(s string) string {
+	out, ok := canonicalSegment(s)
+	if !ok {
+		return ""
+	}
+	return out
 }
 
 // bucketFor is the ONLY way a bucket name is derived. Tenant isolation is
 // structural: a caller supplies a `module`, never a raw bucket, so it can only
 // ever touch `t-<tenant>-<module>`.
 func bucketFor(tenant, module string) (string, *handlerErr) {
-	t := sanitizeSegment(tenant)
-	m := sanitizeSegment(module)
-	if t == "" || m == "" {
-		return "", errf(422, "tenant and module must be non-empty alphanumeric")
+	t, tOK := canonicalSegment(tenant)
+	m, mOK := canonicalSegment(module)
+	if !tOK || !mOK {
+		return "", errf(422, "tenant and module must be lowercase alphanumeric with interior dashes only "+
+			"(no leading/trailing dash, max 40 chars)")
 	}
 	return fmt.Sprintf("t-%s-%s", t, m), nil
 }
 
-// tenantPrefix is the bucket-name prefix that scopes list_buckets to one tenant.
-func tenantPrefix(tenant string) string { return "t-" + sanitizeSegment(tenant) + "-" }
+// tenantPrefix is the bucket-name prefix that scopes list_buckets to one
+// tenant. An invalid tenant yields a prefix that matches nothing rather than
+// one that matches everything — failing closed on a listing path.
+func tenantPrefix(tenant string) string {
+	t, ok := canonicalSegment(tenant)
+	if !ok {
+		return "\x00-never-matches-"
+	}
+	return "t-" + t + "-"
+}
 
 func buildTools() []toolDef {
 	obj := func(props map[string]any, required ...string) map[string]any {

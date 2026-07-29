@@ -100,6 +100,77 @@ else
   skip "contract/minio-mcp catalog — set MINIO_MCP_TOKEN to assert the tool list"
 fi
 
+# ── 5 · security posture, asserted rather than assumed ──────────────────────
+# Liveness alone cannot tell an authenticated surface from an open one: a
+# sidecar deployed with MCP_AUTH_TOKEN unset used to answer 200 to ANY bearer,
+# and every probe above would still have reported it healthy. These checks look
+# for the specific failure, not for signs of life.
+
+# 5a. The tool surface must never serve an unauthenticated caller. 401 (no
+#     credential) and 503 (server has no token configured, fail-closed) are both
+#     correct refusals. 200 is the bug.
+code="$(status_in_net "$MCP_TOOLS_URL")"
+case "$code" in
+  401|503) ok "security/minio-mcp refuses unauthenticated /tools ($code)" ;;
+  200)     bad "security/minio-mcp SERVED /tools WITH NO CREDENTIAL (200) — the surface is open to anything on $NETWORK" ;;
+  *)       bad "security/minio-mcp unauthenticated /tools returned unexpected $code (want 401 or 503)" ;;
+esac
+
+# 5b. An arbitrary bearer must not be accepted either. This is the exact
+#     fail-open that shipped: presence-only auth treated any non-empty token as
+#     valid, which on a flat network is every container in the cluster.
+code="$(status_in_net "$MCP_TOOLS_URL" -H "Authorization: Bearer definitely-not-the-real-token")"
+case "$code" in
+  401|503) ok "security/minio-mcp rejects an arbitrary bearer ($code)" ;;
+  200)     bad "security/minio-mcp ACCEPTED AN ARBITRARY BEARER (200) — presence-only auth is back" ;;
+  *)       bad "security/minio-mcp arbitrary bearer returned unexpected $code (want 401 or 503)" ;;
+esac
+
+# 5c. Posture, self-reported. /healthz is unauthenticated on purpose so an
+#     orchestrator can distinguish "misconfigured" from "down", and it states
+#     whether idempotency replay actually survives a restart — a silent
+#     downgrade to the in-memory store is otherwise indistinguishable from
+#     durability.
+health="$(curl_in_net -s "http://minio-mcp:8090/healthz")"
+if [[ -z "$health" ]]; then
+  bad "security/minio-mcp /healthz did not answer"
+else
+  case "$health" in
+    *'"auth":"insecure-explicitly-allowed"'*)
+      bad "security/minio-mcp is running with MCP_ALLOW_INSECURE — no caller authentication" ;;
+    *'"auth":"fail-closed"'*)
+      bad "security/minio-mcp has no MCP_AUTH_TOKEN configured; it is refusing all tool traffic" ;;
+    *'"auth":"token-verify"'*)
+      ok "security/minio-mcp is enforcing token-verify auth" ;;
+    *)
+      bad "security/minio-mcp /healthz auth mode unrecognised: ${health:0:160}" ;;
+  esac
+  case "$health" in
+    *'"replay_durable":true'*)  ok "durability/minio-mcp idempotency replay survives a restart" ;;
+    *'"replay_durable":false'*) skip "durability/minio-mcp replay is in-memory — a retry after a restart re-executes (set MINIO_MCP_REPLAY_REDIS_URL)" ;;
+    *)                          bad "durability/minio-mcp /healthz did not report replay_durable" ;;
+  esac
+fi
+
+# 5d. Tenant buckets must not be world-readable. bootstrap.sh creates them
+#     private and SSE-KMS applies at rest, but neither is proven by a config
+#     file — an anonymous GET is.
+probe_bucket="${SMOKE_PROBE_BUCKET:-t-default-safedocs}"
+code="$(status_in_net "http://minio:9000/${probe_bucket}/")"
+case "$code" in
+  403|401) ok "security/minio bucket ${probe_bucket} refuses anonymous access ($code)" ;;
+  404)     skip "security/minio bucket ${probe_bucket} not present — set SMOKE_PROBE_BUCKET to one that is" ;;
+  200)     bad "security/minio bucket ${probe_bucket} IS PUBLICLY LISTABLE (200)" ;;
+  *)       bad "security/minio anonymous bucket probe returned unexpected $code" ;;
+esac
+
+# NOTE — deliberately NOT claimed as verified here: SSE-KMS (KES) key usage,
+# OIDC federation to the `erp` realm, and per-module service-account scoping.
+# They are configured in bootstrap.sh + docker-compose.yml, but proving them
+# needs a live KES and Keycloak plus real per-module credentials, which this
+# probe does not have. Asserting them from config alone would be a green light
+# for something never tested. See README.md § "What is proven vs configured".
+
 # ── report ──────────────────────────────────────────────────────────────────
 log ""
 log "──────── minio smoke ────────"
