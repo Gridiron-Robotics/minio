@@ -22,17 +22,50 @@ Everything Gridiron-specific lives in two added directories beside the engine:
 
 ## Security (matches the other modules)
 - **Caller gate**: `Authorization: Bearer` verified constant-time against
-  `MCP_AUTH_TOKEN` (presence-only when unset — never open). `HEAD /` exempt.
+  `MCP_AUTH_TOKEN`. An **unset token fails closed** — `/tools` and `/invoke`
+  answer `503` naming the server's misconfiguration, rather than serving object
+  storage to anything that can reach the port. Reopening it for local dev needs
+  an explicit `MCP_ALLOW_INSECURE=true` and produces a loud boot warning.
+  `HEAD /` and `GET /healthz` stay exempt so probes still work.
 - **Tenant isolation is structural**: tools take a `module`, never a raw bucket;
   the sidecar derives `bucket = t-<tenant>-<module>` from the authoritative
-  `X-Tenant-Id` header and sanitizes both segments, so a caller can **never**
-  name another tenant's bucket. `list_buckets` only returns `t-<tenant>-*`.
-- **Idempotency**: `Idempotency-Key` header → per-tenant replay of mutating tools.
+  `X-Tenant-Id` header. Both segments must **already be canonical** (lowercase
+  alphanumeric, interior dashes only) — a malformed segment is refused `422`,
+  never repaired. `list_buckets` only returns `t-<tenant>-*`.
+- **Idempotency**: `Idempotency-Key` header → per-tenant replay of mutating
+  tools, in a **bounded** store (LRU + TTL, `MINIO_MCP_REPLAY_MAX` /
+  `MINIO_MCP_REPLAY_TTL`). Set `MINIO_MCP_REPLAY_REDIS_URL` to make replay
+  **durable across restarts**; `/healthz` reports `replay_durable` so an
+  in-memory fallback is visible rather than assumed.
+- **Self-heal rail**: `ERROR`-severity records ship to the module's OpenObserve
+  stream over OTLP (`OTEL_*`, same contract as the estate Python drop-in), which
+  is what fires the `level=error` alert into the langgraph diagnose → fix→PR
+  loop. Only 5xx faults emit; 4xx caller errors deliberately do not page.
 - **Single login**: MinIO's native OIDC federation points at the `erp` realm
   (console + STS delegate to Keycloak) — config, not code (`MINIO_OIDC_*`).
 - **Encryption at rest**: SSE-KMS via a KES endpoint (`MINIO_KMS_KES_*`).
 - **Per-module service accounts** with policies scoped to their buckets
   (`deploy/bootstrap.sh`, `deploy/policies/`). The image tag is **pinned**.
+
+### What is proven vs configured
+
+Being explicit about this, because "it is in the compose file" and "it is
+enforced" are different claims and only one of them is testable here.
+
+| Control | Status | How it is proven |
+|---|---|---|
+| Fail-closed caller auth | **Proven** | Unit tests (unset token → 503 for any bearer; mutation-verified) + `deploy/smoke.sh` asserts the live surface never returns 200 without a valid token |
+| Tenant isolation / no segment collapse | **Proven** | Handler tests drive the real S3 client and assert the bucket **on the wire**; hostile `X-Tenant-Id` values are refused |
+| Replay bounded (LRU + TTL) | **Proven** | Unit tests for capacity eviction, LRU order and TTL expiry |
+| Replay durable across restart | **Proven (Redis path)** | A store rebuilt over the same backing data still replays; `/healthz` reports which store is live |
+| Error → OpenObserve → self-heal | **Proven (emit side)** | A real upstream failure emits an `ERROR`-severity record carrying tool + tenant; `severity_text` is asserted because OpenObserve reads `level` from it |
+| Buckets are not public | **Proven (live)** | `smoke.sh` anonymous GET must be refused |
+| SSE-KMS (KES) actually encrypting | **Configured only** | Needs a live KES; no automated proof |
+| OIDC federation to the `erp` realm | **Configured only** | Needs a live Keycloak; no automated proof |
+| Per-module service-account scoping | **Configured only** | Needs real per-module credentials to attempt a cross-module access and be denied |
+
+The three "configured only" rows are the honest remaining gap. They are not
+asserted by any gate, so a regression in them would not be caught.
 
 ## Boot it (on the shared network)
 ```bash

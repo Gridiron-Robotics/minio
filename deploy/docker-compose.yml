@@ -68,9 +68,13 @@ services:
       # module service-account keys (scoped by policy in bootstrap.sh)
       MCP_MINIO_ACCESS_KEY: ${MCP_MINIO_ACCESS_KEY:?}
       MCP_MINIO_SECRET_KEY: ${MCP_MINIO_SECRET_KEY:?}
-      # space-separated tenant + module lists to pre-provision buckets for
+      # Space-separated tenant + module lists to pre-provision buckets for.
+      # A module absent from this list has no bucket and no scoped service
+      # account, so it cannot store anything — the list has to lead the module
+      # rollout, not follow it. `shipping` and `catalog` are here for the tire
+      # commerce modules alongside the existing `orders`/`inventory`.
       BOOTSTRAP_TENANTS: ${BOOTSTRAP_TENANTS:-default}
-      BOOTSTRAP_MODULES: ${BOOTSTRAP_MODULES:-safedocs nocobase gdc floorplans bigcapital lago inventree horilla openproject marketing orders inventory}
+      BOOTSTRAP_MODULES: ${BOOTSTRAP_MODULES:-safedocs nocobase gdc floorplans bigcapital lago inventree horilla openproject marketing orders inventory shipping catalog}
     entrypoint: ["/bin/sh", "/bootstrap.sh"]
     volumes:
       - ./bootstrap.sh:/bootstrap.sh:ro
