@@ -22,7 +22,10 @@ Everything Gridiron-specific lives in two added directories beside the engine:
 
 ## Security (matches the other modules)
 - **Caller gate**: `Authorization: Bearer` verified constant-time against
-  `MCP_AUTH_TOKEN` (presence-only when unset — never open). `HEAD /` exempt.
+  `MCP_AUTH_TOKEN`, which is **required** — unset, the sidecar refuses to boot
+  (exit 78) and compose refuses to start. `MINIO_MCP_ALLOW_INSECURE=1` is a
+  local-dev-only escape that boots a **deny-all** surface (every `/tools` and
+  `/invoke` call is 401). `HEAD /` exempt so gateways probe tokenlessly.
 - **Tenant isolation is structural**: tools take a `module`, never a raw bucket;
   the sidecar derives `bucket = t-<tenant>-<module>` from the authoritative
   `X-Tenant-Id` header and sanitizes both segments, so a caller can **never**

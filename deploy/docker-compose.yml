@@ -92,9 +92,10 @@ services:
       MINIO_SECURE: "false"
       MINIO_ACCESS_KEY: ${MCP_MINIO_ACCESS_KEY:?}
       MINIO_SECRET_KEY: ${MCP_MINIO_SECRET_KEY:?}
-      # Caller gate — the brain/gateways present this bearer. MUST be set in
-      # staging/prod; unset = presence-only (never open, but weaker).
-      MCP_AUTH_TOKEN: ${MINIO_MCP_TOKEN:-}
+      # Caller gate — the brain/gateways present this bearer. REQUIRED: the
+      # sidecar refuses to boot without it (exit 78), so compose fails fast here
+      # rather than starting a server that authenticates no one.
+      MCP_AUTH_TOKEN: "${MINIO_MCP_TOKEN:?set MINIO_MCP_TOKEN — the Contract-A bearer; must match the brain's GATEWAY_TOKENS[minio-mcp]}"
       MINIO_PRESIGN_EXPIRY: ${MINIO_PRESIGN_EXPIRY:-15m}
     ports:
       - "${MINIO_MCP_PORT:-8090}:8090"

@@ -53,3 +53,6 @@ s3-check-md5
 s3-verify
 xattr
 xl-meta
+
+# Gridiron: deploy secrets (deploy/.env.example is the tracked template).
+deploy/.env

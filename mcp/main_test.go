@@ -135,13 +135,36 @@ func TestInvokeMissingRequired422(t *testing.T) {
 	}
 }
 
-func TestPresenceOnlyWhenNoToken(t *testing.T) {
+// With no MCP_AUTH_TOKEN configured the sidecar must fail CLOSED. It previously
+// accepted any non-empty bearer, which handed put_object/delete_object/
+// presign_put/ensure_bucket to any caller that could reach the port.
+func TestNoTokenDeniesEveryCaller(t *testing.T) {
 	s := testServer(t, "")
 	if rec := do(s, http.MethodGet, "/tools", "", ""); rec.Code != http.StatusUnauthorized {
-		t.Fatalf("presence-only: no bearer -> %d, want 401", rec.Code)
+		t.Fatalf("no token configured, no bearer -> %d, want 401", rec.Code)
 	}
-	if rec := do(s, http.MethodGet, "/tools", "anything", ""); rec.Code != http.StatusOK {
-		t.Fatalf("presence-only: any bearer -> %d, want 200", rec.Code)
+	if rec := do(s, http.MethodGet, "/tools", "anything", ""); rec.Code != http.StatusUnauthorized {
+		t.Fatalf("no token configured, any bearer -> %d, want 401 (must fail closed)", rec.Code)
+	}
+	rec := do(s, http.MethodPost, "/invoke", "anything", `{"tool":"put_object","arguments":{}}`)
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("no token configured, /invoke with any bearer -> %d, want 401", rec.Code)
+	}
+	// HEAD / stays unauthenticated so gateways and deploy/smoke.sh still probe.
+	if rec := do(s, http.MethodHead, "/", "", ""); rec.Code != http.StatusOK {
+		t.Fatalf("HEAD / -> %d, want 200 even with no token configured", rec.Code)
+	}
+}
+
+func TestBootRefusesWithoutToken(t *testing.T) {
+	if bootRefusal(config{}) == "" {
+		t.Fatal("no token and no opt-out: want a boot refusal, got none")
+	}
+	if msg := bootRefusal(config{authSet: true}); msg != "" {
+		t.Fatalf("token set: want boot, got refusal %q", msg)
+	}
+	if msg := bootRefusal(config{allowInsecure: true}); msg != "" {
+		t.Fatalf("%s=1: want boot (deny-all), got refusal %q", allowInsecureVar, msg)
 	}
 }
 

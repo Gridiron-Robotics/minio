@@ -16,8 +16,10 @@
 //	POST /invoke               -> {"tool","result"[,"replayed":true]}
 //	HEAD /                     -> 200 (health; unauthenticated so gateways can probe)
 //
-// Auth: shared-bearer caller gate via MCP_AUTH_TOKEN (constant-time compare when
-// set; presence-only when unset — never open). Tenant via X-Tenant-Id.
+// Auth: shared-bearer caller gate via MCP_AUTH_TOKEN, verified constant-time.
+// The token is REQUIRED: with it unset the server refuses to boot (exit 78,
+// EX_CONFIG) unless MINIO_MCP_ALLOW_INSECURE=1, which starts a deny-all surface
+// where every /tools and /invoke call answers 401. Tenant via X-Tenant-Id.
 // Idempotency via Idempotency-Key (per-tenant replay cache).
 package main
 
@@ -39,12 +41,18 @@ import (
 
 const serverName = "minio"
 
+// allowInsecureVar opts a local-dev run out of the boot refusal when
+// MCP_AUTH_TOKEN is unset. The server still authenticates no one: /tools and
+// /invoke answer 401 for every caller. Never set it in staging/prod.
+const allowInsecureVar = "MINIO_MCP_ALLOW_INSECURE"
+
 // config is read once at boot from the environment.
 type config struct {
 	addr          string // MCP listen address
-	authToken     string // MCP_AUTH_TOKEN — caller gate (empty = presence-only)
+	authToken     string // MCP_AUTH_TOKEN — required caller gate
 	authDigest    [32]byte
 	authSet       bool
+	allowInsecure bool   // MINIO_MCP_ALLOW_INSECURE — boot tokenless, deny everyone
 	s3Endpoint    string // MINIO_ENDPOINT host:port (no scheme)
 	s3AccessKey   string
 	s3SecretKey   string
@@ -56,6 +64,7 @@ func loadConfig() config {
 	c := config{
 		addr:          getenv("MINIO_MCP_ADDR", ":8090"),
 		authToken:     os.Getenv("MCP_AUTH_TOKEN"),
+		allowInsecure: truthy(os.Getenv(allowInsecureVar)),
 		s3Endpoint:    getenv("MINIO_ENDPOINT", "minio:9000"),
 		s3AccessKey:   os.Getenv("MINIO_ACCESS_KEY"),
 		s3SecretKey:   os.Getenv("MINIO_SECRET_KEY"),
@@ -97,8 +106,26 @@ func newServer(cfg config) (*server, error) {
 	return s, nil
 }
 
+// bootRefusal reports why the process must not start, or "" when it may.
+// An unset MCP_AUTH_TOKEN is fatal because the tools behind the gate
+// (put_object, delete_object, presign_put, ensure_bucket) reach every tenant
+// bucket this sidecar's service account can see: booting without a caller gate
+// would hand blob write+delete to anyone who can reach the port.
+func bootRefusal(cfg config) string {
+	if cfg.authSet || cfg.allowInsecure {
+		return ""
+	}
+	return "minio-mcp: refusing to start: MCP_AUTH_TOKEN is not set. Set it (and " +
+		"match the brain's GATEWAY_TOKENS[minio-mcp]), or set " + allowInsecureVar +
+		"=1 for a local-dev run that authenticates no one."
+}
+
 func main() {
 	cfg := loadConfig()
+	if msg := bootRefusal(cfg); msg != "" {
+		log.Print(msg)
+		os.Exit(78) // EX_CONFIG — same refusal as the other estate MCP servers.
+	}
 	s, err := newServer(cfg)
 	if err != nil {
 		log.Fatalf("minio-mcp: cannot init S3 client: %v", err)
@@ -111,7 +138,7 @@ func main() {
 	if cfg.authSet {
 		log.Printf("minio-mcp: listening on %s (auth: token-verify), s3=%s", cfg.addr, cfg.s3Endpoint)
 	} else {
-		log.Printf("minio-mcp: listening on %s (auth: presence-only — set MCP_AUTH_TOKEN), s3=%s", cfg.addr, cfg.s3Endpoint)
+		log.Printf("minio-mcp: listening on %s (auth: DENY-ALL — %s=1 with no MCP_AUTH_TOKEN; /tools and /invoke answer 401), s3=%s", cfg.addr, allowInsecureVar, cfg.s3Endpoint)
 	}
 	srv := &http.Server{Addr: cfg.addr, Handler: mux, ReadHeaderTimeout: 10 * time.Second}
 	log.Fatal(srv.ListenAndServe())
@@ -245,7 +272,8 @@ func (s *server) handleInvoke(w http.ResponseWriter, r *http.Request) {
 // ---- auth ------------------------------------------------------------------
 
 // authOK gates /tools and /invoke. Returns false (and writes 401) when the
-// caller is not authenticated. HEAD / never calls this.
+// caller is not authenticated. With no MCP_AUTH_TOKEN configured it denies
+// everyone rather than falling open. HEAD / never calls this.
 func (s *server) authOK(w http.ResponseWriter, r *http.Request) bool {
 	h := r.Header.Get("Authorization")
 	const p = "Bearer "
@@ -258,12 +286,15 @@ func (s *server) authOK(w http.ResponseWriter, r *http.Request) bool {
 		writeErr(w, http.StatusUnauthorized, "missing bearer token")
 		return false
 	}
-	if s.cfg.authSet {
-		got := sha256.Sum256([]byte(token))
-		if subtle.ConstantTimeCompare(got[:], s.cfg.authDigest[:]) != 1 {
-			writeErr(w, http.StatusUnauthorized, "invalid bearer token")
-			return false
-		}
+	if !s.cfg.authSet {
+		writeErr(w, http.StatusUnauthorized,
+			"MCP_AUTH_TOKEN is not configured; this server authenticates no one")
+		return false
+	}
+	got := sha256.Sum256([]byte(token))
+	if subtle.ConstantTimeCompare(got[:], s.cfg.authDigest[:]) != 1 {
+		writeErr(w, http.StatusUnauthorized, "invalid bearer token")
+		return false
 	}
 	return true
 }
