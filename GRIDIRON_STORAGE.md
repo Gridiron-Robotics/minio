@@ -31,20 +31,38 @@ Everything Gridiron-specific lives in two added directories beside the engine:
   `X-Tenant-Id` header and sanitizes both segments, so a caller can **never**
   name another tenant's bucket. `list_buckets` only returns `t-<tenant>-*`.
 - **Idempotency**: `Idempotency-Key` header → per-tenant replay of mutating tools.
+  The replay cache is bounded (oldest-evicted past 5000 entries, so a
+  caller-supplied key cannot exhaust memory) and **in-memory only** — it does not
+  survive a sidecar restart, so a brain retry after a bounce may re-execute.
 - **Single login**: MinIO's native OIDC federation points at the `erp` realm
   (console + STS delegate to Keycloak) — config, not code (`MINIO_OIDC_*`).
 - **Encryption at rest**: SSE-KMS via a KES endpoint (`MINIO_KMS_KES_*`).
 - **Per-module service accounts** with policies scoped to their buckets
-  (`deploy/bootstrap.sh`, `deploy/policies/`). The image tag is **pinned**.
+  (`deploy/bootstrap.sh`, `deploy/policies/`). **Image tags are pinned** — the
+  engine images by release tag, the sidecar by a required `MINIO_MCP_IMAGE_TAG`
+  (compose refuses to start without it), and the sidecar's Dockerfile base images
+  by digest — no floating `:latest` on the infra path.
+- **Self-heal rail**: when `OTEL_EXPORTER_OTLP_ENDPOINT` is set, a `>=500` storage
+  failure ships a `level=error` record to OpenObserve under
+  `service.name=minio-mcp`, firing the estate self-heal alert. Caller mistakes
+  (4xx) do not page. Optional — unset = a silent no-op, so telemetry is never a
+  boot dependency (`mcp/selfheal.go`, `OTEL_*` in `deploy/.env.example`).
 
 ## Boot it (on the shared network)
 ```bash
-cd deploy && cp .env.example .env    # set MINIO_ROOT_PASSWORD, MCP_MINIO_SECRET_KEY, MINIO_MCP_TOKEN
+cd deploy && cp .env.example .env    # set MINIO_ROOT_PASSWORD, MCP_MINIO_SECRET_KEY, MINIO_MCP_TOKEN, MINIO_MCP_IMAGE_TAG
 docker network create erp_shared_network 2>/dev/null || true
 docker compose up -d                 # minio + bootstrap (buckets/policies) + minio-mcp
 docker compose exec minio mc ls gr   # buckets exist
 curl -s -H "Authorization: Bearer $MINIO_MCP_TOKEN" http://localhost:8090/tools?server=minio | head
 ```
+
+## Gates
+- **Offline**: `STRICT=1 ./repo-gates/verify.sh` — go fmt/vet/test the sidecar,
+  version-pinning, `docker compose config`, shell lint. Needs no live stack; runs
+  in CI on any change under `mcp/**`, `deploy/**`, `repo-gates/**`.
+- **Live**: `deploy/smoke.sh` — probes the already-running stack by container name
+  on `erp_shared_network`. Both must be green.
 
 ## How a module uses it
 - **Object I/O**: talk S3 directly to `minio:9000` with the module's scoped

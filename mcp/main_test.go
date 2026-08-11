@@ -24,9 +24,18 @@ func testServer(t *testing.T, token string) *server {
 }
 
 func do(s *server, method, path, token, body string) *httptest.ResponseRecorder {
+	return doH(s, method, path, token, nil, body)
+}
+
+// doH is do with arbitrary request headers, so tests can exercise X-Tenant-Id
+// and Idempotency-Key (neither of which the bare `do` sets).
+func doH(s *server, method, path, token string, headers map[string]string, body string) *httptest.ResponseRecorder {
 	req := httptest.NewRequest(method, path, strings.NewReader(body))
 	if token != "" {
 		req.Header.Set("Authorization", "Bearer "+token)
+	}
+	for k, v := range headers {
+		req.Header.Set(k, v)
 	}
 	rec := httptest.NewRecorder()
 	switch {

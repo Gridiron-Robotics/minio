@@ -37,9 +37,17 @@ import (
 
 	"github.com/minio/minio-go/v7"
 	"github.com/minio/minio-go/v7/pkg/credentials"
+	"go.opentelemetry.io/otel/attribute"
 )
 
 const serverName = "minio"
+
+// maxReplayEntries bounds the idempotency replay cache. The key half is the
+// caller-supplied Idempotency-Key header, so an unbounded map is a
+// memory-exhaustion vector for any authenticated caller; past this bound the
+// oldest entries are evicted first. Matches the estate's bound
+// (safedocs MAX_REPLAY_ENTRIES = 5000).
+const maxReplayEntries = 5000
 
 // allowInsecureVar opts a local-dev run out of the boot refusal when
 // MCP_AUTH_TOKEN is unset. The server still authenticates no one: /tools and
@@ -84,9 +92,11 @@ type server struct {
 	minio  *minio.Client
 	tools  []toolDef
 	byName map[string]toolDef
+	obs    Emitter // self-heal rail; NopEmitter() until main() wires OTLP
 
-	replayMu sync.Mutex
-	replay   map[string]map[string]any // (tenant\x00key) -> stored payload
+	replayMu    sync.Mutex
+	replay      map[string]map[string]any // (tenant\x00key) -> stored payload
+	replayOrder []string                  // insertion order, oldest first (eviction)
 }
 
 func newServer(cfg config) (*server, error) {
@@ -97,7 +107,7 @@ func newServer(cfg config) (*server, error) {
 	if err != nil {
 		return nil, err
 	}
-	s := &server{cfg: cfg, minio: mc, replay: map[string]map[string]any{}}
+	s := &server{cfg: cfg, minio: mc, replay: map[string]map[string]any{}, replayOrder: []string{}, obs: NopEmitter()}
 	s.tools = buildTools()
 	s.byName = map[string]toolDef{}
 	for _, t := range s.tools {
@@ -126,10 +136,21 @@ func main() {
 		log.Print(msg)
 		os.Exit(78) // EX_CONFIG — same refusal as the other estate MCP servers.
 	}
+	// Self-heal rail: a disabled no-op unless OTEL_EXPORTER_OTLP_ENDPOINT is set,
+	// so telemetry is never a boot dependency for storage.
+	ctx := context.Background()
+	obs, _ := Init(ctx, Options{ServiceName: DefaultServiceName}, nil)
+	defer func() { _ = obs.Shutdown(context.Background()) }()
+
 	s, err := newServer(cfg)
 	if err != nil {
+		// A sidecar that cannot build its S3 client is exactly the incident this
+		// rail exists for; flush before the process exits.
+		obs.Error(ctx, "minio-mcp: cannot init S3 client", attribute.String("err", err.Error()))
+		_ = obs.ForceFlush(ctx)
 		log.Fatalf("minio-mcp: cannot init S3 client: %v", err)
 	}
+	s.obs = obs
 	mux := http.NewServeMux()
 	mux.HandleFunc("/tools", s.handleTools)
 	mux.HandleFunc("/invoke", s.handleInvoke)
@@ -257,16 +278,43 @@ func (s *server) handleInvoke(w http.ResponseWriter, r *http.Request) {
 	defer cancel()
 	result, herr := tool.Handler(ctx, s, tenant, args)
 	if herr != nil {
+		if herr.status >= 500 {
+			// Contract A returns structured non-2xx, so there is no unhandled 5xx
+			// for an alert to hang off; the rail must be fired here explicitly.
+			// Caller mistakes (4xx: bad base64, missing object) do NOT page.
+			s.obs.Error(ctx, "minio mcp tool failed",
+				attribute.String("tool", tool.Name),
+				attribute.String("tenant", tenant),
+				attribute.Int("status", herr.status),
+				attribute.String("err", herr.msg))
+		}
 		writeErr(w, herr.status, herr.msg)
 		return
 	}
 	payload := map[string]any{"tool": tool.Name, "result": result}
 	if idem != "" {
-		s.replayMu.Lock()
-		s.replay[replayKey] = map[string]any{"tool": tool.Name, "result": result}
-		s.replayMu.Unlock()
+		s.rememberReplay(replayKey, map[string]any{"tool": tool.Name, "result": result})
 	}
 	writeJSON(w, http.StatusOK, payload)
+}
+
+// rememberReplay stores a result for (tenant, Idempotency-Key), evicting the
+// oldest entries once the map exceeds maxReplayEntries. The key half is
+// caller-supplied, so an unbounded map is a memory-exhaustion vector for any
+// authenticated caller. Replay is in-memory only — it does NOT survive a
+// restart, so the brain's retry after a sidecar bounce may re-execute.
+func (s *server) rememberReplay(key string, payload map[string]any) {
+	s.replayMu.Lock()
+	defer s.replayMu.Unlock()
+	if _, exists := s.replay[key]; !exists {
+		s.replayOrder = append(s.replayOrder, key)
+	}
+	s.replay[key] = payload
+	for len(s.replayOrder) > maxReplayEntries {
+		oldest := s.replayOrder[0]
+		s.replayOrder = s.replayOrder[1:]
+		delete(s.replay, oldest)
+	}
 }
 
 // ---- auth ------------------------------------------------------------------

@@ -81,7 +81,11 @@ services:
   minio-mcp:
     build:
       context: ../mcp
-    image: ghcr.io/gridiron-robotics/minio-mcp:latest
+    # Pinned, immutable reference — no floating tags on the infra path (estate
+    # supply-chain rule). The `build:` block above is what produces this tag
+    # locally; the required variable is what stops an unlabelled build from
+    # masquerading as a release. Set MINIO_MCP_IMAGE_TAG to a released tag or git sha.
+    image: ghcr.io/gridiron-robotics/minio-mcp:${MINIO_MCP_IMAGE_TAG:?set MINIO_MCP_IMAGE_TAG to a released image tag or sha}
     container_name: minio-mcp
     depends_on:
       minio:
@@ -97,6 +101,14 @@ services:
       # rather than starting a server that authenticates no one.
       MCP_AUTH_TOKEN: "${MINIO_MCP_TOKEN:?set MINIO_MCP_TOKEN — the Contract-A bearer; must match the brain's GATEWAY_TOKENS[minio-mcp]}"
       MINIO_PRESIGN_EXPIRY: ${MINIO_PRESIGN_EXPIRY:-15m}
+      # Self-heal rail (OpenObserve/OTLP). OPTIONAL — all unset = a silent no-op
+      # (unlike the auth token, telemetry must never be a boot dependency). When
+      # the endpoint is set, a >=500 storage failure ships a level=error record
+      # under service.name=minio-mcp, which fires the estate self-heal alert.
+      OTEL_ENABLED: ${OTEL_ENABLED:-}
+      OTEL_EXPORTER_OTLP_ENDPOINT: ${OTEL_EXPORTER_OTLP_ENDPOINT:-}
+      OTEL_EXPORTER_OTLP_HEADERS: ${OTEL_EXPORTER_OTLP_HEADERS:-}
+      OTEL_SERVICE_NAME: ${OTEL_SERVICE_NAME:-minio-mcp}
     ports:
       - "${MINIO_MCP_PORT:-8090}:8090"
     networks: [erp_shared_network]

@@ -56,3 +56,6 @@ xl-meta
 
 # Gridiron: deploy secrets (deploy/.env.example is the tracked template).
 deploy/.env
+
+# Gridiron: locally-built MCP sidecar binary (built into the image, never committed).
+mcp/minio-mcp
