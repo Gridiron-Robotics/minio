@@ -230,3 +230,32 @@ func TestBucketForTenantIsolation(t *testing.T) {
 		t.Fatalf("bucket name %q is not path-safe", b)
 	}
 }
+
+// ALLOW_INSECURE excuses running WITHOUT a token (deny-all dev mode). It must
+// NOT excuse running WITH a guessable one: when a token is set the server runs
+// in token-VERIFY mode and that value is a live credential.
+//
+// The first version of the placeholder guard returned early on allowInsecure
+// above the placeholder/length checks, so
+//
+//	MINIO_MCP_ALLOW_INSECURE=1 MCP_AUTH_TOKEN=change_me
+//
+// booted in verify mode and ACCEPTED the publicly-known bearer — granting
+// put_object/delete_object/presign_put on every tenant bucket to anyone who
+// read the sample env file. Found by the 2026-08-17 adversarial review.
+func TestAllowInsecureDoesNotExcuseAWeakToken(t *testing.T) {
+	for _, tok := range []string{"change_me", "change_me_min_8_chars", "secret", "0123456789abcde"} {
+		if msg := bootRefusal(config{allowInsecure: true, authSet: true, authToken: tok}); msg == "" {
+			t.Errorf("ALLOW_INSECURE=1 with weak token %q booted in verify mode — "+
+				"want a refusal; the escape hatch is for TOKENLESS deny-all only", tok)
+		}
+	}
+	// The documented escape still works: no token at all boots deny-all.
+	if msg := bootRefusal(config{allowInsecure: true}); msg != "" {
+		t.Fatalf("%s=1 with no token: want boot (deny-all), got refusal %q", allowInsecureVar, msg)
+	}
+	// And a real token still boots with the escape set.
+	if msg := bootRefusal(config{allowInsecure: true, authSet: true, authToken: realToken}); msg != "" {
+		t.Fatalf("ALLOW_INSECURE=1 with a real token: want boot, got refusal %q", msg)
+	}
+}

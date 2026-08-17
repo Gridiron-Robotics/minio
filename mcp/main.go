@@ -124,19 +124,27 @@ func newServer(cfg config) (*server, error) {
 // bucket this sidecar's service account can see: booting without a caller gate
 // would hand blob write+delete to anyone who can reach the port.
 func bootRefusal(cfg config) string {
-	if cfg.allowInsecure {
-		return "" // documented local-dev escape: boots, authenticates no one
-	}
 	if !cfg.authSet {
+		if cfg.allowInsecure {
+			return "" // documented local-dev escape: boots TOKENLESS, authenticates no one
+		}
 		return "minio-mcp: refusing to start: MCP_AUTH_TOKEN is not set. Set it (and " +
 			"match the brain's GATEWAY_TOKENS[minio-mcp]), or set " + allowInsecureVar +
 			"=1 for a local-dev run that authenticates no one."
 	}
+	// A token IS set, so the server runs in token-VERIFY mode (not deny-all) and
+	// this value is a live credential — the only gate in front of write+delete on
+	// every tenant bucket. allowInsecure excuses running WITHOUT a token; it must
+	// never excuse running with a guessable one. The first version of this guard
+	// returned early on allowInsecure above these checks, so
+	// `MINIO_MCP_ALLOW_INSECURE=1 MCP_AUTH_TOKEN=change_me` booted in verify mode
+	// and ACCEPTED the publicly-known bearer — a bypass of the very check below.
 	if isPlaceholderToken(cfg.authToken) {
 		return "minio-mcp: refusing to start: MCP_AUTH_TOKEN is a placeholder/sample " +
-			"value. compose only enforces that the variable is NON-EMPTY, so a copied " +
-			".env.example ships a publicly-known bearer that grants put/delete on every " +
-			"tenant bucket. Set a real secret (>=" + strconv.Itoa(minAuthTokenLen) + " chars) from Infisical."
+			"value. compose only enforces that the variable is NON-EMPTY (${VAR:?}), so " +
+			"any throwaway value becomes a publicly-guessable bearer that grants " +
+			"put/delete on every tenant bucket. Set a real secret (>=" +
+			strconv.Itoa(minAuthTokenLen) + " chars) from Infisical."
 	}
 	if len(strings.TrimSpace(cfg.authToken)) < minAuthTokenLen {
 		return "minio-mcp: refusing to start: MCP_AUTH_TOKEN is shorter than " +
