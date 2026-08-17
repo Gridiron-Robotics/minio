@@ -57,6 +57,19 @@ Everything Gridiron-specific lives in two added directories beside the engine:
   engine images by release tag, the sidecar by a required `MINIO_MCP_IMAGE_TAG`
   (compose refuses to start without it), and the sidecar's Dockerfile base images
   by digest — no floating `:latest` on the infra path.
+- **Known gaps (not fixed here, do not assume otherwise)**:
+  1. `X-Tenant-Id` is *trusted*, not proven. The sidecar confines a caller to the
+     tenant the header names; it does not verify that the caller is that tenant.
+     Anyone holding the single shared bearer can set any tenant. Real isolation
+     between callers needs a per-tenant token or a Keycloak claim — not built.
+  2. `deploy/policies/tenant-scoped.json.tmpl` grants `t-${TENANT}-*` on the
+     **direct-S3** path, and that wildcard still matches a longer tenant's
+     buckets (`t-acme-*` covers `t-acme-hr-payroll`). S3 policy wildcards cannot
+     express "no dash", so render this template with one explicit
+     `arn:aws:s3:::t-<tenant>-<module>` per provisioned module instead of the
+     wildcard. The MCP path is not affected (it derives names in code).
+  3. The replay cache is per-process and in-memory; two sidecar replicas behind
+     one gateway do not share idempotency state.
 - **Self-heal rail**: when `OTEL_EXPORTER_OTLP_ENDPOINT` is set, a `>=500` storage
   failure ships a `level=error` record to OpenObserve under
   `service.name=minio-mcp`, firing the estate self-heal alert. Caller mistakes
