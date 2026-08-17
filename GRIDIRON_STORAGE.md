@@ -23,17 +23,32 @@ Everything Gridiron-specific lives in two added directories beside the engine:
 ## Security (matches the other modules)
 - **Caller gate**: `Authorization: Bearer` verified constant-time against
   `MCP_AUTH_TOKEN`, which is **required** — unset, the sidecar refuses to boot
-  (exit 78) and compose refuses to start. `MINIO_MCP_ALLOW_INSECURE=1` is a
-  local-dev-only escape that boots a **deny-all** surface (every `/tools` and
-  `/invoke` call is 401). `HEAD /` exempt so gateways probe tokenlessly.
+  (exit 78) and compose refuses to start. It must also be a *real* secret:
+  compose only enforces **non-empty**, so the sidecar itself also refuses a
+  placeholder (`change_me…`, `changeme`, `secret`, `your-…`) or anything under 16
+  characters. `MINIO_MCP_ALLOW_INSECURE=1` is a local-dev-only escape that boots a
+  **deny-all** surface (every `/tools` and `/invoke` call is 401). `HEAD /` exempt
+  so gateways probe tokenlessly.
 - **Tenant isolation is structural**: tools take a `module`, never a raw bucket;
   the sidecar derives `bucket = t-<tenant>-<module>` from the authoritative
-  `X-Tenant-Id` header and sanitizes both segments, so a caller can **never**
-  name another tenant's bucket. `list_buckets` only returns `t-<tenant>-*`.
-- **Idempotency**: `Idempotency-Key` header → per-tenant replay of mutating tools.
-  The replay cache is bounded (oldest-evicted past 5000 entries, so a
-  caller-supplied key cannot exhaust memory) and **in-memory only** — it does not
-  survive a sidecar restart, so a brain retry after a bounce may re-execute.
+  `X-Tenant-Id` header. The derivation must be **injective** to isolate anything:
+  a tenant slug legitimately contains dashes (`gridiron-robotics`), so the
+  caller-supplied **module may not** — `[a-z0-9]+` only. Otherwise tenant `acme`
+  asking for module `hr-payroll` lands exactly on tenant `acme-hr`'s `payroll`
+  bucket. Segments are **validated, not rewritten** (rewriting mapped `acme_hr`
+  onto `acme-hr`, merging two tenants) and over-long ids are rejected, not
+  truncated. `list_buckets` returns only buckets whose remainder after
+  `t-<tenant>-` contains no dash, so a sibling tenant's inventory
+  (`t-acme-hr-payroll` seen by tenant `acme`) stays hidden. Object keys reject
+  `.`/`..`/absolute segments, so a presigned URL cannot be normalized by a browser
+  into a path other than the one that was signed.
+- **Idempotency**: `Idempotency-Key` header → per-tenant replay. The cache key is
+  (tenant, key, fingerprint of tool+arguments): a reused key on a *different* call
+  executes instead of returning the earlier call's envelope — keyed on the header
+  alone, a reused key made a `delete_object` report success and never run. The
+  cache is bounded (oldest-evicted past 5000 entries, so a caller-supplied key
+  cannot exhaust memory) and **in-memory only** — it does not survive a sidecar
+  restart, so a brain retry after a bounce may re-execute.
 - **Single login**: MinIO's native OIDC federation points at the `erp` realm
   (console + STS delegate to Keycloak) — config, not code (`MINIO_OIDC_*`).
 - **Encryption at rest**: SSE-KMS via a KES endpoint (`MINIO_KMS_KES_*`).
