@@ -165,31 +165,68 @@ func TestNoTokenDeniesEveryCaller(t *testing.T) {
 	}
 }
 
+// realToken is a stand-in for a real Infisical-issued bearer: long enough and not
+// a sample value, so bootRefusal must let it through.
+const realToken = "Zk3Qm8vT1sB7xH2pR9wL4nC6"
+
 func TestBootRefusesWithoutToken(t *testing.T) {
 	if bootRefusal(config{}) == "" {
 		t.Fatal("no token and no opt-out: want a boot refusal, got none")
 	}
-	if msg := bootRefusal(config{authSet: true}); msg != "" {
-		t.Fatalf("token set: want boot, got refusal %q", msg)
+	if msg := bootRefusal(config{authSet: true, authToken: realToken}); msg != "" {
+		t.Fatalf("real token set: want boot, got refusal %q", msg)
 	}
 	if msg := bootRefusal(config{allowInsecure: true}); msg != "" {
 		t.Fatalf("%s=1: want boot (deny-all), got refusal %q", allowInsecureVar, msg)
 	}
 }
 
+// compose only enforces that MINIO_MCP_TOKEN is NON-EMPTY (${VAR:?}), so a copied
+// .env.example or a throwaway value boots a sidecar whose single bearer — the only
+// thing in front of put_object/delete_object/presign_put on EVERY tenant bucket —
+// is publicly known or trivially guessable.
+func TestBootRefusesPlaceholderOrWeakToken(t *testing.T) {
+	for _, tok := range []string{
+		"change_me_min_8_chars", // literally .env.example's sample value
+		"changeme", "CHANGEME", "secret", "token", "placeholder", "your-token-here",
+		"short", "0123456789abcde", // 15 chars: below the floor
+	} {
+		if msg := bootRefusal(config{authSet: true, authToken: tok}); msg == "" {
+			t.Errorf("token %q booted — want a refusal", tok)
+		}
+	}
+	for _, tok := range []string{realToken, "0123456789abcdef", strings.Repeat("k", 64)} {
+		if msg := bootRefusal(config{authSet: true, authToken: tok}); msg != "" {
+			t.Errorf("token %q refused (%q) — a real secret must boot", tok, msg)
+		}
+	}
+}
+
+// Replaces the previous sanitize-and-proceed assertion: a tenant value that does
+// not normalize to a valid segment is now REJECTED rather than rewritten, because
+// rewriting mapped distinct tenants onto one bucket (see tenant_test.go).
 func TestBucketForTenantIsolation(t *testing.T) {
 	b, herr := bucketFor("acme", "orders")
 	if herr != nil || b != "t-acme-orders" {
 		t.Fatalf("bucketFor(acme,orders) = %q,%v want t-acme-orders", b, herr)
 	}
-	b2, herr := bucketFor("acme/../globex", "or ders")
-	if herr != nil {
-		t.Fatalf("unexpected err: %v", herr)
+	for _, bad := range []string{"acme/../globex", "acme hr", "-acme", "acme-", ""} {
+		got, herr := bucketFor(bad, "orders")
+		if herr == nil {
+			t.Fatalf("tenant %q accepted as %q — want a 422 rejection", bad, got)
+		}
+		if herr.status != 422 {
+			t.Fatalf("tenant %q -> status %d, want 422", bad, herr.status)
+		}
 	}
-	if strings.Contains(b2, "/") || strings.Contains(b2, "..") || strings.Contains(b2, " ") {
-		t.Fatalf("sanitize failed: %q", b2)
+	for _, bad := range []string{"or ders", "or/ders", "", "orders-v2"} {
+		got, herr := bucketFor("acme", bad)
+		if herr == nil {
+			t.Fatalf("module %q accepted as %q — want a 422 rejection", bad, got)
+		}
 	}
-	if _, herr := bucketFor("", "orders"); herr == nil {
-		t.Fatal("empty tenant should error")
+	// Whatever bucketFor DOES return can never carry a path or a space.
+	if strings.ContainsAny(b, "/ .\\") || strings.Contains(b, "..") {
+		t.Fatalf("bucket name %q is not path-safe", b)
 	}
 }

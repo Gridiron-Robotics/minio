@@ -27,10 +27,12 @@ import (
 	"context"
 	"crypto/sha256"
 	"crypto/subtle"
+	"encoding/hex"
 	"encoding/json"
 	"log"
 	"net/http"
 	"os"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -122,12 +124,44 @@ func newServer(cfg config) (*server, error) {
 // bucket this sidecar's service account can see: booting without a caller gate
 // would hand blob write+delete to anyone who can reach the port.
 func bootRefusal(cfg config) string {
-	if cfg.authSet || cfg.allowInsecure {
-		return ""
+	if cfg.allowInsecure {
+		return "" // documented local-dev escape: boots, authenticates no one
 	}
-	return "minio-mcp: refusing to start: MCP_AUTH_TOKEN is not set. Set it (and " +
-		"match the brain's GATEWAY_TOKENS[minio-mcp]), or set " + allowInsecureVar +
-		"=1 for a local-dev run that authenticates no one."
+	if !cfg.authSet {
+		return "minio-mcp: refusing to start: MCP_AUTH_TOKEN is not set. Set it (and " +
+			"match the brain's GATEWAY_TOKENS[minio-mcp]), or set " + allowInsecureVar +
+			"=1 for a local-dev run that authenticates no one."
+	}
+	if isPlaceholderToken(cfg.authToken) {
+		return "minio-mcp: refusing to start: MCP_AUTH_TOKEN is a placeholder/sample " +
+			"value. compose only enforces that the variable is NON-EMPTY, so a copied " +
+			".env.example ships a publicly-known bearer that grants put/delete on every " +
+			"tenant bucket. Set a real secret (>=" + strconv.Itoa(minAuthTokenLen) + " chars) from Infisical."
+	}
+	if len(strings.TrimSpace(cfg.authToken)) < minAuthTokenLen {
+		return "minio-mcp: refusing to start: MCP_AUTH_TOKEN is shorter than " +
+			strconv.Itoa(minAuthTokenLen) + " characters. This single bearer is the only gate in " +
+			"front of put_object/delete_object/presign_put on every tenant bucket."
+	}
+	return ""
+}
+
+// minAuthTokenLen is the shortest bearer the sidecar will boot with. The token is
+// the ONLY caller gate, so a guessable one is equivalent to no gate at all.
+const minAuthTokenLen = 16
+
+// isPlaceholderToken reports whether the configured bearer is a sample value that
+// ships in a repo (.env.example's `change_me...`) or an obvious stand-in.
+func isPlaceholderToken(token string) bool {
+	t := strings.ToLower(strings.TrimSpace(token))
+	switch t {
+	case "changeme", "change_me", "secret", "password", "token", "test", "example",
+		"placeholder", "todo", "xxx", "minio", "gridiron", "supersecret":
+		return true
+	}
+	return strings.HasPrefix(t, "change_me") || strings.HasPrefix(t, "changeme") ||
+		strings.HasPrefix(t, "your-") || strings.HasPrefix(t, "your_") ||
+		strings.Contains(t, "placeholder")
 }
 
 func main() {
@@ -254,12 +288,16 @@ func (s *server) handleInvoke(w http.ResponseWriter, r *http.Request) {
 	if tenant == "" {
 		tenant = "default"
 	}
-	tenant = sanitizeSegment(tenant)
+	tenant = normalizeSegment(tenant)
 
-	// Idempotent replay for mutating tools: same (tenant, key) returns the
-	// stored result with "replayed":true instead of re-executing.
+	// Idempotent replay: same (tenant, key, request) returns the stored result
+	// with "replayed":true instead of re-executing. The request fingerprint is
+	// part of the cache key on purpose — keyed on (tenant, key) alone, a caller
+	// that reused one Idempotency-Key for a DIFFERENT call got the first call's
+	// envelope back and the second call silently never ran (a delete that reports
+	// success and never happened).
 	idem := r.Header.Get("Idempotency-Key")
-	replayKey := tenant + "\x00" + idem
+	replayKey := tenant + "\x00" + idem + "\x00" + requestFingerprint(tool.Name, args)
 	if idem != "" {
 		s.replayMu.Lock()
 		if prev, hit := s.replay[replayKey]; hit {
@@ -298,7 +336,19 @@ func (s *server) handleInvoke(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, payload)
 }
 
-// rememberReplay stores a result for (tenant, Idempotency-Key), evicting the
+// requestFingerprint is a stable digest of the tool + its arguments. json.Marshal
+// sorts map keys, so argument order in the caller's JSON does not change it.
+func requestFingerprint(tool string, args map[string]any) string {
+	enc, err := json.Marshal(args)
+	if err != nil {
+		// Unmarshalable args cannot be proven identical, so never replay them.
+		return tool + "\x00" + strconv.FormatInt(time.Now().UnixNano(), 36)
+	}
+	sum := sha256.Sum256(append([]byte(tool+"\x00"), enc...))
+	return hex.EncodeToString(sum[:])
+}
+
+// rememberReplay stores a result for (tenant, Idempotency-Key, request), evicting the
 // oldest entries once the map exceeds maxReplayEntries. The key half is
 // caller-supplied, so an unbounded map is a memory-exhaustion vector for any
 // authenticated caller. Replay is in-memory only — it does NOT survive a
