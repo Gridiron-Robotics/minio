@@ -1,0 +1,49 @@
+# minio — the gate pipeline.
+#
+# THE FILENAME IS LOAD-BEARING. Woodpecker derives the workflow name from the
+# config filename (basename -> drop .yml/.yaml -> drop a leading '.'), and that
+# name is the last segment of the commit-status context:
+#
+#     {{ .context }}/{{ .event }}/{{ .workflow }}   ->   ci/woodpecker/pr/gate
+#
+# So `.woodpecker/gate.yaml` yields `.../gate`, whereas a single-file
+# `.woodpecker.yml` would yield `ci/woodpecker/pr/woodpecker`. That string is
+# what branch protection matches — renaming this file renames the required
+# check, and a required check that no longer reports stays permanently pending,
+# blocking every merge. `pull_request` renders as `pr` in the context.
+#
+# Run it locally exactly as CI does, no server needed:
+#
+#     docker run --rm -u 0:0 \
+#       -v /var/run/docker.sock:/var/run/docker.sock \
+#       -v "$PWD:$PWD" -w "$PWD" \
+#       woodpeckerci/woodpecker-cli:v3.17.0 \
+#       exec --local --repo-path "$PWD" .woodpecker/gate.yaml
+#
+# Both odd flags are load-bearing: `-u 0:0` because the CLI image's default
+# user cannot open the docker socket, and `-v "$PWD:$PWD"` because --repo-path
+# is resolved by the HOST daemon (the backend starts sibling containers), so
+# mounting the repo anywhere else runs the step against a silently EMPTY
+# workspace — every command "not found", nothing saying why.
+
+when:
+  - event: [push, pull_request, manual]
+  # No per-repo cron. The estate's nightly verdict comes from the sweep in
+  # langgraph-agents (gate_runner.py), so one job reports every module on one
+  # clock and a module with no pipeline shows up as UNGATED rather than as
+  # silence.
+
+steps:
+  - name: gate
+    # NOT a generic image, and not yet built for this repo. Build it from a
+    # `Dockerfile.gate` carrying exactly this repo's toolchain, then pin it.
+    #
+    # This pipeline is RED until that image exists, and that is the correct
+    # state. The two repos already wired build a dedicated image precisely
+    # because on an unpinned box their checks reported "not installed" rather
+    # than the failures they were. A gate that cannot run must say so.
+    image: ghcr.io/gridiron-robotics/minio-gate:1
+    commands:
+      # ONE entrypoint. Everything "passing" means lives in the script below,
+      # which is the judge — this file must never grow a second opinion.
+      - ./repo-gates/verify.sh
