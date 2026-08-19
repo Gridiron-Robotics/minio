@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/json"
 	"io"
 	"net/http"
 	"strings"
@@ -197,7 +198,84 @@ func TestTraversalKeysRejected(t *testing.T) {
 }
 
 func jsonStr(s string) string {
-	return `"` + strings.ReplaceAll(s, `"`, `\"`) + `"`
+	b, err := json.Marshal(s)
+	if err != nil { // a Go string is always marshalable; keep the helper total anyway
+		return `""`
+	}
+	return string(b)
+}
+
+// listXMLEmpty is an empty (untruncated) ListBucketResult — enough for minio-go
+// to finish a list, so a prefix that is NOT rejected reaches the stub and is
+// visible on the wire.
+const listXMLEmpty = `<?xml version="1.0" encoding="UTF-8"?>
+<ListBucketResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
+  <Name>t-acme-orders</Name><KeyCount>0</KeyCount>
+  <MaxKeys>1000</MaxKeys><IsTruncated>false</IsTruncated>
+</ListBucketResult>`
+
+// list_objects was the ONE tool of six that handed caller-supplied path input to
+// MinIO without the guard the other five apply to `key`. It is not an escape on
+// today's surface — the prefix rides in a query parameter, the tool is read-only,
+// and the bucket is still derived server-side from the tenant — but "today" is
+// the entire claim, and the tool that does not follow the rule is exactly where
+// the next change introduces a real hole. The segments a key is refused for must
+// be refused for a prefix, and refused BEFORE any S3 call.
+func TestTraversalPrefixesRejected(t *testing.T) {
+	var seen []string
+	s := s3Stub(t, func(w http.ResponseWriter, r *http.Request) {
+		if answerLocation(w, r) {
+			return
+		}
+		seen = append(seen, r.URL.Path+"?"+r.URL.RawQuery)
+		w.Header().Set("Content-Type", "application/xml")
+		_, _ = io.WriteString(w, listXMLEmpty)
+	})
+	for _, bad := range []string{
+		"../t-globex-orders/", "a/../../x", "/abs/", `a\b`, "a//b", "..", ".", "reports/./q4",
+	} {
+		body := `{"tool":"list_objects","arguments":{"module":"orders","prefix":` + jsonStr(bad) + `}}`
+		code, _ := invokeResult(t, s, "acme", body)
+		if code != http.StatusUnprocessableEntity {
+			t.Fatalf("list_objects with prefix %q -> %d, want 422 (the guard the other five tools apply)", bad, code)
+		}
+	}
+	if len(seen) != 0 {
+		t.Fatalf("traversal prefixes reached S3 %d time(s): %v", len(seen), seen)
+	}
+}
+
+// The guard must be applied, not faked by dropping the argument: a legitimate
+// prefix must still reach MinIO verbatim — including the trailing-slash "folder"
+// form, which is the one shape a prefix may have and a key may not.
+func TestLegitimatePrefixReachesS3Verbatim(t *testing.T) {
+	for _, want := range []string{"", "reports/", "reports/q4", "reports/q4-final", "a/b/c"} {
+		var got string
+		calls := 0
+		s := s3Stub(t, func(w http.ResponseWriter, r *http.Request) {
+			if answerLocation(w, r) {
+				return
+			}
+			calls++
+			got = r.URL.Query().Get("prefix")
+			w.Header().Set("Content-Type", "application/xml")
+			_, _ = io.WriteString(w, listXMLEmpty)
+		})
+		code, res := invokeResult(t, s, "acme",
+			`{"tool":"list_objects","arguments":{"module":"orders","prefix":`+jsonStr(want)+`}}`)
+		if code != http.StatusOK {
+			t.Fatalf("list_objects with legitimate prefix %q -> %d, want 200", want, code)
+		}
+		if calls == 0 {
+			t.Fatalf("prefix %q: no list call reached S3", want)
+		}
+		if got != want {
+			t.Fatalf("prefix on the wire = %q, want %q — the guard must not rewrite or drop it", got, want)
+		}
+		if res["bucket"] != "t-acme-orders" {
+			t.Fatalf("bucket = %v, want t-acme-orders", res["bucket"])
+		}
+	}
 }
 
 // stat_object mapped EVERY error to 404, so a dead or unreachable store answered

@@ -125,6 +125,27 @@ func moduleOfBucket(tenant, bucket string) (string, bool) {
 	return rest, true
 }
 
+// checkTraversal is THE path-traversal guard for caller-supplied object paths.
+// It lives in one function so the key form and the prefix form can never drift
+// into two different rules: list_objects used to be the one tool that handed its
+// caller input to MinIO unchecked, and a second, separately-written guard is how
+// that gap comes back. `allowTrailingSlash` is the single concession a prefix
+// needs (see objectPrefix); a key must not have it.
+func checkTraversal(label, p string, allowTrailingSlash bool) *handlerErr {
+	if strings.HasPrefix(p, "/") || strings.Contains(p, `\`) {
+		return errf(422, "%s must be a relative object path (no leading '/' or backslash)", label)
+	}
+	if allowTrailingSlash {
+		p = strings.TrimSuffix(p, "/")
+	}
+	for _, seg := range strings.Split(p, "/") {
+		if seg == "." || seg == ".." || seg == "" {
+			return errf(422, "%s must not contain empty, '.' or '..' path segments", label)
+		}
+	}
+	return nil
+}
+
 // objectKey validates the caller-supplied object key. MinIO itself routes with
 // SkipClean(true) (cmd/routers.go), so "../" in a key is a literal key there and
 // not a bucket escape — but the sidecar also hands keys to *presigned URLs* that
@@ -135,15 +156,36 @@ func objectKey(args map[string]any) (string, *handlerErr) {
 	if key == "" {
 		return "", errf(422, "key must be a non-empty string")
 	}
-	if strings.HasPrefix(key, "/") || strings.Contains(key, `\`) {
-		return "", errf(422, "key must be a relative object key (no leading '/' or backslash)")
-	}
-	for _, seg := range strings.Split(key, "/") {
-		if seg == "." || seg == ".." || seg == "" {
-			return "", errf(422, "key must not contain empty, '.' or '..' path segments")
-		}
+	if herr := checkTraversal("key", key, false); herr != nil {
+		return "", herr
 	}
 	return key, nil
+}
+
+// objectPrefix validates list_objects' optional `prefix` with the SAME guard the
+// five key-taking tools apply. list_objects was the odd one out: it passed the
+// caller's prefix straight to MinIO. Not exploitable on today's surface — the
+// prefix rides in a query parameter, the tool is read-only, and the bucket is
+// still derived server-side from the tenant — but it was the one tool that did
+// not follow the rule, so the next change to it starts from an unguarded input.
+//
+// The shape differs from a key in exactly two ways, both inherent to a prefix
+// rather than concessions to it:
+//   - it may be absent/empty, which means "list the whole bucket";
+//   - it may end in "/" ("reports/"), the ordinary "list this folder" form,
+//     which as a key would be a trailing empty segment and is rejected there.
+//
+// Traversal segments are rejected identically, so a prefix can still only ever
+// mean "under this tenant's bucket".
+func objectPrefix(args map[string]any) (string, *handlerErr) {
+	prefix := strArg(args, "prefix")
+	if prefix == "" {
+		return "", nil
+	}
+	if herr := checkTraversal("prefix", prefix, true); herr != nil {
+		return "", herr
+	}
+	return prefix, nil
 }
 
 func buildTools() []toolDef {
@@ -167,7 +209,7 @@ func buildTools() []toolDef {
 		},
 		{
 			Name:        "list_objects",
-			Description: "List objects under a key prefix in the tenant's module bucket. Read-only. Args: module, prefix (optional), recursive (optional bool), max (optional int, default 1000).",
+			Description: "List objects under a key prefix in the tenant's module bucket. Read-only. Args: module, prefix (optional relative prefix — no leading '/', no backslash, no '.'/'..' segments; may end in '/'), recursive (optional bool), max (optional int, default 1000).",
 			InputSchema: obj(map[string]any{
 				"module": str, "prefix": str,
 				"recursive": map[string]any{"type": "boolean"},
@@ -263,9 +305,13 @@ func hListObjects(ctx context.Context, s *server, tenant string, args map[string
 	if herr != nil {
 		return nil, herr
 	}
+	prefix, herr := objectPrefix(args)
+	if herr != nil {
+		return nil, herr
+	}
 	max := intArg(args, "max", 1000)
 	opts := minio.ListObjectsOptions{
-		Prefix:    strArg(args, "prefix"),
+		Prefix:    prefix,
 		Recursive: boolArg(args, "recursive", false),
 	}
 	out := []map[string]any{}
