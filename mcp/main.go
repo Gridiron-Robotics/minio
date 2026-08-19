@@ -16,8 +16,10 @@
 //	POST /invoke               -> {"tool","result"[,"replayed":true]}
 //	HEAD /                     -> 200 (health; unauthenticated so gateways can probe)
 //
-// Auth: shared-bearer caller gate via MCP_AUTH_TOKEN (constant-time compare when
-// set; presence-only when unset — never open). Tenant via X-Tenant-Id.
+// Auth: shared-bearer caller gate via MCP_AUTH_TOKEN, verified constant-time.
+// The token is REQUIRED: with it unset the server refuses to boot (exit 78,
+// EX_CONFIG) unless MINIO_MCP_ALLOW_INSECURE=1, which starts a deny-all surface
+// where every /tools and /invoke call answers 401. Tenant via X-Tenant-Id.
 // Idempotency via Idempotency-Key (per-tenant replay cache).
 package main
 
@@ -25,26 +27,42 @@ import (
 	"context"
 	"crypto/sha256"
 	"crypto/subtle"
+	"encoding/hex"
 	"encoding/json"
 	"log"
 	"net/http"
 	"os"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/minio/minio-go/v7"
 	"github.com/minio/minio-go/v7/pkg/credentials"
+	"go.opentelemetry.io/otel/attribute"
 )
 
 const serverName = "minio"
 
+// maxReplayEntries bounds the idempotency replay cache. The key half is the
+// caller-supplied Idempotency-Key header, so an unbounded map is a
+// memory-exhaustion vector for any authenticated caller; past this bound the
+// oldest entries are evicted first. Matches the estate's bound
+// (safedocs MAX_REPLAY_ENTRIES = 5000).
+const maxReplayEntries = 5000
+
+// allowInsecureVar opts a local-dev run out of the boot refusal when
+// MCP_AUTH_TOKEN is unset. The server still authenticates no one: /tools and
+// /invoke answer 401 for every caller. Never set it in staging/prod.
+const allowInsecureVar = "MINIO_MCP_ALLOW_INSECURE"
+
 // config is read once at boot from the environment.
 type config struct {
 	addr          string // MCP listen address
-	authToken     string // MCP_AUTH_TOKEN — caller gate (empty = presence-only)
+	authToken     string // MCP_AUTH_TOKEN — required caller gate
 	authDigest    [32]byte
 	authSet       bool
+	allowInsecure bool   // MINIO_MCP_ALLOW_INSECURE — boot tokenless, deny everyone
 	s3Endpoint    string // MINIO_ENDPOINT host:port (no scheme)
 	s3AccessKey   string
 	s3SecretKey   string
@@ -56,6 +74,7 @@ func loadConfig() config {
 	c := config{
 		addr:          getenv("MINIO_MCP_ADDR", ":8090"),
 		authToken:     os.Getenv("MCP_AUTH_TOKEN"),
+		allowInsecure: truthy(os.Getenv(allowInsecureVar)),
 		s3Endpoint:    getenv("MINIO_ENDPOINT", "minio:9000"),
 		s3AccessKey:   os.Getenv("MINIO_ACCESS_KEY"),
 		s3SecretKey:   os.Getenv("MINIO_SECRET_KEY"),
@@ -75,9 +94,11 @@ type server struct {
 	minio  *minio.Client
 	tools  []toolDef
 	byName map[string]toolDef
+	obs    Emitter // self-heal rail; NopEmitter() until main() wires OTLP
 
-	replayMu sync.Mutex
-	replay   map[string]map[string]any // (tenant\x00key) -> stored payload
+	replayMu    sync.Mutex
+	replay      map[string]map[string]any // (tenant\x00key) -> stored payload
+	replayOrder []string                  // insertion order, oldest first (eviction)
 }
 
 func newServer(cfg config) (*server, error) {
@@ -88,7 +109,7 @@ func newServer(cfg config) (*server, error) {
 	if err != nil {
 		return nil, err
 	}
-	s := &server{cfg: cfg, minio: mc, replay: map[string]map[string]any{}}
+	s := &server{cfg: cfg, minio: mc, replay: map[string]map[string]any{}, replayOrder: []string{}, obs: NopEmitter()}
 	s.tools = buildTools()
 	s.byName = map[string]toolDef{}
 	for _, t := range s.tools {
@@ -97,12 +118,81 @@ func newServer(cfg config) (*server, error) {
 	return s, nil
 }
 
+// bootRefusal reports why the process must not start, or "" when it may.
+// An unset MCP_AUTH_TOKEN is fatal because the tools behind the gate
+// (put_object, delete_object, presign_put, ensure_bucket) reach every tenant
+// bucket this sidecar's service account can see: booting without a caller gate
+// would hand blob write+delete to anyone who can reach the port.
+func bootRefusal(cfg config) string {
+	if !cfg.authSet {
+		if cfg.allowInsecure {
+			return "" // documented local-dev escape: boots TOKENLESS, authenticates no one
+		}
+		return "minio-mcp: refusing to start: MCP_AUTH_TOKEN is not set. Set it (and " +
+			"match the brain's GATEWAY_TOKENS[minio-mcp]), or set " + allowInsecureVar +
+			"=1 for a local-dev run that authenticates no one."
+	}
+	// A token IS set, so the server runs in token-VERIFY mode (not deny-all) and
+	// this value is a live credential — the only gate in front of write+delete on
+	// every tenant bucket. allowInsecure excuses running WITHOUT a token; it must
+	// never excuse running with a guessable one. The first version of this guard
+	// returned early on allowInsecure above these checks, so
+	// `MINIO_MCP_ALLOW_INSECURE=1 MCP_AUTH_TOKEN=change_me` booted in verify mode
+	// and ACCEPTED the publicly-known bearer — a bypass of the very check below.
+	if isPlaceholderToken(cfg.authToken) {
+		return "minio-mcp: refusing to start: MCP_AUTH_TOKEN is a placeholder/sample " +
+			"value. compose only enforces that the variable is NON-EMPTY (${VAR:?}), so " +
+			"any throwaway value becomes a publicly-guessable bearer that grants " +
+			"put/delete on every tenant bucket. Set a real secret (>=" +
+			strconv.Itoa(minAuthTokenLen) + " chars) from Infisical."
+	}
+	if len(strings.TrimSpace(cfg.authToken)) < minAuthTokenLen {
+		return "minio-mcp: refusing to start: MCP_AUTH_TOKEN is shorter than " +
+			strconv.Itoa(minAuthTokenLen) + " characters. This single bearer is the only gate in " +
+			"front of put_object/delete_object/presign_put on every tenant bucket."
+	}
+	return ""
+}
+
+// minAuthTokenLen is the shortest bearer the sidecar will boot with. The token is
+// the ONLY caller gate, so a guessable one is equivalent to no gate at all.
+const minAuthTokenLen = 16
+
+// isPlaceholderToken reports whether the configured bearer is a sample value that
+// ships in a repo (.env.example's `change_me...`) or an obvious stand-in.
+func isPlaceholderToken(token string) bool {
+	t := strings.ToLower(strings.TrimSpace(token))
+	switch t {
+	case "changeme", "change_me", "secret", "password", "token", "test", "example",
+		"placeholder", "todo", "xxx", "minio", "gridiron", "supersecret":
+		return true
+	}
+	return strings.HasPrefix(t, "change_me") || strings.HasPrefix(t, "changeme") ||
+		strings.HasPrefix(t, "your-") || strings.HasPrefix(t, "your_") ||
+		strings.Contains(t, "placeholder")
+}
+
 func main() {
 	cfg := loadConfig()
+	if msg := bootRefusal(cfg); msg != "" {
+		log.Print(msg)
+		os.Exit(78) // EX_CONFIG — same refusal as the other estate MCP servers.
+	}
+	// Self-heal rail: a disabled no-op unless OTEL_EXPORTER_OTLP_ENDPOINT is set,
+	// so telemetry is never a boot dependency for storage.
+	ctx := context.Background()
+	obs, _ := Init(ctx, Options{ServiceName: DefaultServiceName}, nil)
+	defer func() { _ = obs.Shutdown(context.Background()) }()
+
 	s, err := newServer(cfg)
 	if err != nil {
+		// A sidecar that cannot build its S3 client is exactly the incident this
+		// rail exists for; flush before the process exits.
+		obs.Error(ctx, "minio-mcp: cannot init S3 client", attribute.String("err", err.Error()))
+		_ = obs.ForceFlush(ctx)
 		log.Fatalf("minio-mcp: cannot init S3 client: %v", err)
 	}
+	s.obs = obs
 	mux := http.NewServeMux()
 	mux.HandleFunc("/tools", s.handleTools)
 	mux.HandleFunc("/invoke", s.handleInvoke)
@@ -111,7 +201,7 @@ func main() {
 	if cfg.authSet {
 		log.Printf("minio-mcp: listening on %s (auth: token-verify), s3=%s", cfg.addr, cfg.s3Endpoint)
 	} else {
-		log.Printf("minio-mcp: listening on %s (auth: presence-only — set MCP_AUTH_TOKEN), s3=%s", cfg.addr, cfg.s3Endpoint)
+		log.Printf("minio-mcp: listening on %s (auth: DENY-ALL — %s=1 with no MCP_AUTH_TOKEN; /tools and /invoke answer 401), s3=%s", cfg.addr, allowInsecureVar, cfg.s3Endpoint)
 	}
 	srv := &http.Server{Addr: cfg.addr, Handler: mux, ReadHeaderTimeout: 10 * time.Second}
 	log.Fatal(srv.ListenAndServe())
@@ -206,12 +296,16 @@ func (s *server) handleInvoke(w http.ResponseWriter, r *http.Request) {
 	if tenant == "" {
 		tenant = "default"
 	}
-	tenant = sanitizeSegment(tenant)
+	tenant = normalizeSegment(tenant)
 
-	// Idempotent replay for mutating tools: same (tenant, key) returns the
-	// stored result with "replayed":true instead of re-executing.
+	// Idempotent replay: same (tenant, key, request) returns the stored result
+	// with "replayed":true instead of re-executing. The request fingerprint is
+	// part of the cache key on purpose — keyed on (tenant, key) alone, a caller
+	// that reused one Idempotency-Key for a DIFFERENT call got the first call's
+	// envelope back and the second call silently never ran (a delete that reports
+	// success and never happened).
 	idem := r.Header.Get("Idempotency-Key")
-	replayKey := tenant + "\x00" + idem
+	replayKey := tenant + "\x00" + idem + "\x00" + requestFingerprint(tool.Name, args)
 	if idem != "" {
 		s.replayMu.Lock()
 		if prev, hit := s.replay[replayKey]; hit {
@@ -230,22 +324,62 @@ func (s *server) handleInvoke(w http.ResponseWriter, r *http.Request) {
 	defer cancel()
 	result, herr := tool.Handler(ctx, s, tenant, args)
 	if herr != nil {
+		if herr.status >= 500 {
+			// Contract A returns structured non-2xx, so there is no unhandled 5xx
+			// for an alert to hang off; the rail must be fired here explicitly.
+			// Caller mistakes (4xx: bad base64, missing object) do NOT page.
+			s.obs.Error(ctx, "minio mcp tool failed",
+				attribute.String("tool", tool.Name),
+				attribute.String("tenant", tenant),
+				attribute.Int("status", herr.status),
+				attribute.String("err", herr.msg))
+		}
 		writeErr(w, herr.status, herr.msg)
 		return
 	}
 	payload := map[string]any{"tool": tool.Name, "result": result}
 	if idem != "" {
-		s.replayMu.Lock()
-		s.replay[replayKey] = map[string]any{"tool": tool.Name, "result": result}
-		s.replayMu.Unlock()
+		s.rememberReplay(replayKey, map[string]any{"tool": tool.Name, "result": result})
 	}
 	writeJSON(w, http.StatusOK, payload)
+}
+
+// requestFingerprint is a stable digest of the tool + its arguments. json.Marshal
+// sorts map keys, so argument order in the caller's JSON does not change it.
+func requestFingerprint(tool string, args map[string]any) string {
+	enc, err := json.Marshal(args)
+	if err != nil {
+		// Unmarshalable args cannot be proven identical, so never replay them.
+		return tool + "\x00" + strconv.FormatInt(time.Now().UnixNano(), 36)
+	}
+	sum := sha256.Sum256(append([]byte(tool+"\x00"), enc...))
+	return hex.EncodeToString(sum[:])
+}
+
+// rememberReplay stores a result for (tenant, Idempotency-Key, request), evicting the
+// oldest entries once the map exceeds maxReplayEntries. The key half is
+// caller-supplied, so an unbounded map is a memory-exhaustion vector for any
+// authenticated caller. Replay is in-memory only — it does NOT survive a
+// restart, so the brain's retry after a sidecar bounce may re-execute.
+func (s *server) rememberReplay(key string, payload map[string]any) {
+	s.replayMu.Lock()
+	defer s.replayMu.Unlock()
+	if _, exists := s.replay[key]; !exists {
+		s.replayOrder = append(s.replayOrder, key)
+	}
+	s.replay[key] = payload
+	for len(s.replayOrder) > maxReplayEntries {
+		oldest := s.replayOrder[0]
+		s.replayOrder = s.replayOrder[1:]
+		delete(s.replay, oldest)
+	}
 }
 
 // ---- auth ------------------------------------------------------------------
 
 // authOK gates /tools and /invoke. Returns false (and writes 401) when the
-// caller is not authenticated. HEAD / never calls this.
+// caller is not authenticated. With no MCP_AUTH_TOKEN configured it denies
+// everyone rather than falling open. HEAD / never calls this.
 func (s *server) authOK(w http.ResponseWriter, r *http.Request) bool {
 	h := r.Header.Get("Authorization")
 	const p = "Bearer "
@@ -258,12 +392,15 @@ func (s *server) authOK(w http.ResponseWriter, r *http.Request) bool {
 		writeErr(w, http.StatusUnauthorized, "missing bearer token")
 		return false
 	}
-	if s.cfg.authSet {
-		got := sha256.Sum256([]byte(token))
-		if subtle.ConstantTimeCompare(got[:], s.cfg.authDigest[:]) != 1 {
-			writeErr(w, http.StatusUnauthorized, "invalid bearer token")
-			return false
-		}
+	if !s.cfg.authSet {
+		writeErr(w, http.StatusUnauthorized,
+			"MCP_AUTH_TOKEN is not configured; this server authenticates no one")
+		return false
+	}
+	got := sha256.Sum256([]byte(token))
+	if subtle.ConstantTimeCompare(got[:], s.cfg.authDigest[:]) != 1 {
+		writeErr(w, http.StatusUnauthorized, "invalid bearer token")
+		return false
 	}
 	return true
 }

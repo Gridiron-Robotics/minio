@@ -1,0 +1,35 @@
+# Gridiron overlay gate — ADDITIVE. Does not touch the upstream engine workflows.
+# Runs the offline judge (repo-gates/verify.sh) for the mcp/ sidecar + deploy/
+# overlay only. Triggered solely by changes under those paths.
+name: Gridiron MCP overlay
+
+on:
+  pull_request:
+    branches:
+      - master
+    paths:
+      - "mcp/**"
+      - "deploy/**"
+      - "repo-gates/**"
+      - ".github/workflows/gridiron-mcp.yml"
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.head_ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    name: repo-gates/verify.sh (STRICT)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          # The sidecar module (mcp/go.mod) is go 1.25 — matches the estate's
+          # OTel stack (Ach-payments, lago/integrations/mcp).
+          go-version: "1.25.x"
+      - name: Run the offline overlay gate
+        run: STRICT=1 ./repo-gates/verify.sh

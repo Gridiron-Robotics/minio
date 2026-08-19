@@ -9,6 +9,30 @@ set -eu
 
 mc alias set gr "$MINIO_ENDPOINT" "$MINIO_ROOT_USER" "$MINIO_ROOT_PASSWORD"
 
+# Bucket names are t-<tenant>-<module>. That is only unambiguous while at most ONE
+# of the two segments may contain the "-" separator: with a dashed module,
+# tenant "acme" + module "hr-payroll" and tenant "acme-hr" + module "payroll" name
+# the SAME bucket, and the per-module policy below (t-*-<module>) matches across
+# tenants the same way. Tenant slugs legitimately carry dashes, so the module is
+# the segment that may not. The MCP sidecar enforces the identical rule
+# (mcp/tools.go bucketFor); refuse here rather than provision a bucket the sidecar
+# can never safely address.
+echo "==> validating tenant/module names"
+for t in $BOOTSTRAP_TENANTS; do
+  case "$t" in
+    *[!a-z0-9-]* | -* | *- | "")
+      echo "FATAL: tenant '$t' must be lowercase letters/digits/dashes with no leading or trailing dash" >&2
+      exit 2 ;;
+  esac
+done
+for m in $BOOTSTRAP_MODULES; do
+  case "$m" in
+    *[!a-z0-9]* | "")
+      echo "FATAL: module '$m' must be lowercase letters and digits only — a dash in the module makes t-<tenant>-<module> ambiguous across tenants" >&2
+      exit 2 ;;
+  esac
+done
+
 echo "==> buckets"
 for t in $BOOTSTRAP_TENANTS; do
   for m in $BOOTSTRAP_MODULES; do

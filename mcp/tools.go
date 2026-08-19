@@ -33,36 +33,160 @@ type toolDef struct {
 	Handler     toolHandler
 }
 
-// segRe validates a tenant/module segment used to build a bucket name.
-var segRe = regexp.MustCompile(`[^a-z0-9-]`)
+// Bucket names are "t-<tenant>-<module>". That composition is only injective —
+// i.e. only actually isolating — if at most ONE of the two segments may contain
+// the "-" separator. Tenant ids in this estate are slugs that DO contain dashes
+// (gridiron-robotics), so the MODULE segment is the one that must not:
+//
+//	tenant "acme"    + module "hr-payroll" -> t-acme-hr-payroll
+//	tenant "acme-hr" + module "payroll"    -> t-acme-hr-payroll   <- same bucket
+//
+// With a dash-free module the last segment is unambiguously the module and the
+// middle is unambiguously the tenant, so no (tenant, module) pair a caller can
+// ask for lands on another tenant's bucket.
+var (
+	// tenantRe: lowercase alnum + dashes, no leading/trailing dash (S3 rules).
+	tenantRe = regexp.MustCompile(`^[a-z0-9]([a-z0-9-]*[a-z0-9])?$`)
+	// moduleRe: lowercase alnum only — deliberately NO dash (see above).
+	moduleRe = regexp.MustCompile(`^[a-z0-9]+$`)
+)
 
-// sanitizeSegment lower-cases and strips anything not valid in an S3 bucket
-// segment, so a hostile tenant/module value can't inject a path or a foreign
-// bucket name.
-func sanitizeSegment(s string) string {
-	s = strings.ToLower(strings.TrimSpace(s))
-	s = segRe.ReplaceAllString(s, "-")
-	s = strings.Trim(s, "-")
-	if len(s) > 40 {
-		s = s[:40]
+const (
+	maxSegmentLen = 40 // per segment
+	maxBucketLen  = 63 // S3/MinIO hard limit for a bucket name
+)
+
+// normalizeSegment lower-cases and trims a segment. It deliberately does NOT
+// rewrite invalid characters: mangling maps distinct identities onto ONE bucket
+// ("acme_hr" and "acme-hr" both became "acme-hr"), silently merging two tenants'
+// namespaces. Anything that does not normalize to a valid segment is rejected by
+// bucketFor instead.
+func normalizeSegment(s string) string { return strings.ToLower(strings.TrimSpace(s)) }
+
+// checkTenant validates the authoritative X-Tenant-Id value and returns its
+// normalized form. Every bucket-touching path goes through it, so an unusable
+// tenant id is a loud 422 rather than a quietly-rewritten namespace.
+func checkTenant(tenant string) (string, *handlerErr) {
+	t := normalizeSegment(tenant)
+	if t == "" || !tenantRe.MatchString(t) {
+		return "", errf(422, "invalid tenant %q: expected lowercase letters, digits and dashes (no leading/trailing dash)", tenant)
 	}
-	return s
+	if len(t) > maxSegmentLen {
+		// Truncating instead would map two long tenant ids sharing a prefix onto
+		// one bucket — the same silent namespace merge as mangling.
+		return "", errf(422, "tenant is longer than %d characters", maxSegmentLen)
+	}
+	return t, nil
 }
 
 // bucketFor is the ONLY way a bucket name is derived. Tenant isolation is
 // structural: a caller supplies a `module`, never a raw bucket, so it can only
-// ever touch `t-<tenant>-<module>`.
+// ever touch `t-<tenant>-<module>` — and because the module may not contain the
+// "-" separator, that name can belong to no other tenant.
 func bucketFor(tenant, module string) (string, *handlerErr) {
-	t := sanitizeSegment(tenant)
-	m := sanitizeSegment(module)
-	if t == "" || m == "" {
-		return "", errf(422, "tenant and module must be non-empty alphanumeric")
+	t, herr := checkTenant(tenant)
+	if herr != nil {
+		return "", herr
 	}
-	return fmt.Sprintf("t-%s-%s", t, m), nil
+	m := normalizeSegment(module)
+	if m == "" || !moduleRe.MatchString(m) {
+		return "", errf(422, "invalid module %q: expected lowercase letters and digits only (no dashes — the dash separates tenant from module in t-<tenant>-<module>)", module)
+	}
+	if len(m) > maxSegmentLen {
+		return "", errf(422, "module is longer than %d characters", maxSegmentLen)
+	}
+	bucket := fmt.Sprintf("t-%s-%s", t, m)
+	if len(bucket) > maxBucketLen {
+		// Caught here as a 422 caller error; otherwise MinIO rejects the name and
+		// the 502 pages the self-heal rail for what is a bad argument.
+		return "", errf(422, "bucket name t-<tenant>-<module> would exceed %d characters", maxBucketLen)
+	}
+	return bucket, nil
 }
 
 // tenantPrefix is the bucket-name prefix that scopes list_buckets to one tenant.
-func tenantPrefix(tenant string) string { return "t-" + sanitizeSegment(tenant) + "-" }
+func tenantPrefix(tenant string) string { return "t-" + normalizeSegment(tenant) + "-" }
+
+// moduleOfBucket returns the module segment of a bucket that belongs to this
+// tenant, and false when the bucket is NOT this tenant's. A plain prefix test is
+// not enough: "t-acme-" also prefixes tenant "acme-hr"'s bucket
+// "t-acme-hr-payroll", which would leak a sibling tenant's bucket names into
+// list_buckets. A module never contains "-", so a remainder that does belongs to
+// a longer tenant id.
+func moduleOfBucket(tenant, bucket string) (string, bool) {
+	prefix := tenantPrefix(tenant)
+	if !strings.HasPrefix(bucket, prefix) {
+		return "", false
+	}
+	rest := strings.TrimPrefix(bucket, prefix)
+	if rest == "" || strings.Contains(rest, "-") {
+		return "", false
+	}
+	return rest, true
+}
+
+// checkTraversal is THE path-traversal guard for caller-supplied object paths.
+// It lives in one function so the key form and the prefix form can never drift
+// into two different rules: list_objects used to be the one tool that handed its
+// caller input to MinIO unchecked, and a second, separately-written guard is how
+// that gap comes back. `allowTrailingSlash` is the single concession a prefix
+// needs (see objectPrefix); a key must not have it.
+func checkTraversal(label, p string, allowTrailingSlash bool) *handlerErr {
+	if strings.HasPrefix(p, "/") || strings.Contains(p, `\`) {
+		return errf(422, "%s must be a relative object path (no leading '/' or backslash)", label)
+	}
+	if allowTrailingSlash {
+		p = strings.TrimSuffix(p, "/")
+	}
+	for _, seg := range strings.Split(p, "/") {
+		if seg == "." || seg == ".." || seg == "" {
+			return errf(422, "%s must not contain empty, '.' or '..' path segments", label)
+		}
+	}
+	return nil
+}
+
+// objectKey validates the caller-supplied object key. MinIO itself routes with
+// SkipClean(true) (cmd/routers.go), so "../" in a key is a literal key there and
+// not a bucket escape — but the sidecar also hands keys to *presigned URLs* that
+// browsers and proxies normalize before sending. Rejecting traversal segments
+// keeps the request that is signed and the request that is sent identical.
+func objectKey(args map[string]any) (string, *handlerErr) {
+	key := strArg(args, "key")
+	if key == "" {
+		return "", errf(422, "key must be a non-empty string")
+	}
+	if herr := checkTraversal("key", key, false); herr != nil {
+		return "", herr
+	}
+	return key, nil
+}
+
+// objectPrefix validates list_objects' optional `prefix` with the SAME guard the
+// five key-taking tools apply. list_objects was the odd one out: it passed the
+// caller's prefix straight to MinIO. Not exploitable on today's surface — the
+// prefix rides in a query parameter, the tool is read-only, and the bucket is
+// still derived server-side from the tenant — but it was the one tool that did
+// not follow the rule, so the next change to it starts from an unguarded input.
+//
+// The shape differs from a key in exactly two ways, both inherent to a prefix
+// rather than concessions to it:
+//   - it may be absent/empty, which means "list the whole bucket";
+//   - it may end in "/" ("reports/"), the ordinary "list this folder" form,
+//     which as a key would be a trailing empty segment and is rejected there.
+//
+// Traversal segments are rejected identically, so a prefix can still only ever
+// mean "under this tenant's bucket".
+func objectPrefix(args map[string]any) (string, *handlerErr) {
+	prefix := strArg(args, "prefix")
+	if prefix == "" {
+		return "", nil
+	}
+	if herr := checkTraversal("prefix", prefix, true); herr != nil {
+		return "", herr
+	}
+	return prefix, nil
+}
 
 func buildTools() []toolDef {
 	obj := func(props map[string]any, required ...string) map[string]any {
@@ -78,14 +202,14 @@ func buildTools() []toolDef {
 		},
 		{
 			Name:        "ensure_bucket",
-			Description: "Idempotently create this tenant's bucket for the given module (t-<tenant>-<module>) if it does not exist. Returns the bucket name.",
+			Description: "Idempotently create this tenant's bucket for the given module (t-<tenant>-<module>) if it does not exist. `module` is lowercase letters/digits only — no dashes. Returns the bucket name.",
 			Destructive: true,
 			InputSchema: obj(map[string]any{"module": str}, "module"),
 			Handler:     hEnsureBucket,
 		},
 		{
 			Name:        "list_objects",
-			Description: "List objects under a key prefix in the tenant's module bucket. Read-only. Args: module, prefix (optional), recursive (optional bool), max (optional int, default 1000).",
+			Description: "List objects under a key prefix in the tenant's module bucket. Read-only. Args: module, prefix (optional relative prefix — no leading '/', no backslash, no '.'/'..' segments; may end in '/'), recursive (optional bool), max (optional int, default 1000).",
 			InputSchema: obj(map[string]any{
 				"module": str, "prefix": str,
 				"recursive": map[string]any{"type": "boolean"},
@@ -135,20 +259,24 @@ func buildTools() []toolDef {
 // ---- handlers --------------------------------------------------------------
 
 func hListBuckets(ctx context.Context, s *server, tenant string, _ map[string]any) (any, *handlerErr) {
+	if _, herr := checkTenant(tenant); herr != nil {
+		return nil, herr
+	}
 	all, err := s.minio.ListBuckets(ctx)
 	if err != nil {
 		return nil, errf(502, "list buckets: %v", err)
 	}
-	prefix := tenantPrefix(tenant)
 	out := []map[string]any{}
 	for _, b := range all {
-		if strings.HasPrefix(b.Name, prefix) {
-			out = append(out, map[string]any{
-				"bucket":  b.Name,
-				"module":  strings.TrimPrefix(b.Name, prefix),
-				"created": b.CreationDate.Format(time.RFC3339),
-			})
+		module, mine := moduleOfBucket(tenant, b.Name)
+		if !mine {
+			continue
 		}
+		out = append(out, map[string]any{
+			"bucket":  b.Name,
+			"module":  module,
+			"created": b.CreationDate.Format(time.RFC3339),
+		})
 	}
 	return map[string]any{"buckets": out}, nil
 }
@@ -177,9 +305,13 @@ func hListObjects(ctx context.Context, s *server, tenant string, args map[string
 	if herr != nil {
 		return nil, herr
 	}
+	prefix, herr := objectPrefix(args)
+	if herr != nil {
+		return nil, herr
+	}
 	max := intArg(args, "max", 1000)
 	opts := minio.ListObjectsOptions{
-		Prefix:    strArg(args, "prefix"),
+		Prefix:    prefix,
 		Recursive: boolArg(args, "recursive", false),
 	}
 	out := []map[string]any{}
@@ -205,10 +337,19 @@ func hStatObject(ctx context.Context, s *server, tenant string, args map[string]
 	if herr != nil {
 		return nil, herr
 	}
-	key := strArg(args, "key")
+	key, herr := objectKey(args)
+	if herr != nil {
+		return nil, herr
+	}
 	info, err := s.minio.StatObject(ctx, bucket, key, minio.StatObjectOptions{})
 	if err != nil {
-		return nil, errf(404, "stat object: %v", err)
+		// A blanket 404 hid every storage outage behind "not found": stat is the
+		// most-called read path, and a 404 never reaches the >=500 self-heal rail,
+		// so a dead store paged nobody. Only a real "no such key" is a 404.
+		if resp := minio.ToErrorResponse(err); resp.StatusCode == 404 {
+			return nil, errf(404, "stat object: %v", err)
+		}
+		return nil, errf(502, "stat object: %v", err)
 	}
 	return map[string]any{
 		"bucket": bucket, "key": info.Key, "size": info.Size, "etag": info.ETag,
@@ -228,7 +369,11 @@ func hPresignGet(ctx context.Context, s *server, tenant string, args map[string]
 	if herr != nil {
 		return nil, herr
 	}
-	u, err := s.minio.PresignedGetObject(ctx, bucket, strArg(args, "key"), s.presignExpiry(args), url.Values{})
+	key, herr := objectKey(args)
+	if herr != nil {
+		return nil, herr
+	}
+	u, err := s.minio.PresignedGetObject(ctx, bucket, key, s.presignExpiry(args), url.Values{})
 	if err != nil {
 		return nil, errf(502, "presign get: %v", err)
 	}
@@ -240,7 +385,11 @@ func hPresignPut(ctx context.Context, s *server, tenant string, args map[string]
 	if herr != nil {
 		return nil, herr
 	}
-	u, err := s.minio.PresignedPutObject(ctx, bucket, strArg(args, "key"), s.presignExpiry(args))
+	key, herr := objectKey(args)
+	if herr != nil {
+		return nil, herr
+	}
+	u, err := s.minio.PresignedPutObject(ctx, bucket, key, s.presignExpiry(args))
 	if err != nil {
 		return nil, errf(502, "presign put: %v", err)
 	}
@@ -252,6 +401,10 @@ func hPutObject(ctx context.Context, s *server, tenant string, args map[string]a
 	if herr != nil {
 		return nil, herr
 	}
+	key, herr := objectKey(args)
+	if herr != nil {
+		return nil, herr
+	}
 	raw, err := base64.StdEncoding.DecodeString(strArg(args, "content_base64"))
 	if err != nil {
 		return nil, errf(422, "content_base64 is not valid base64: %v", err)
@@ -260,7 +413,6 @@ func hPutObject(ctx context.Context, s *server, tenant string, args map[string]a
 	if ct == "" {
 		ct = "application/octet-stream"
 	}
-	key := strArg(args, "key")
 	info, err := s.minio.PutObject(ctx, bucket, key, bytes.NewReader(raw), int64(len(raw)),
 		minio.PutObjectOptions{ContentType: ct})
 	if err != nil {
@@ -274,7 +426,10 @@ func hDeleteObject(ctx context.Context, s *server, tenant string, args map[strin
 	if herr != nil {
 		return nil, herr
 	}
-	key := strArg(args, "key")
+	key, herr := objectKey(args)
+	if herr != nil {
+		return nil, herr
+	}
 	if err := s.minio.RemoveObject(ctx, bucket, key, minio.RemoveObjectOptions{}); err != nil {
 		return nil, errf(502, "delete object: %v", err)
 	}

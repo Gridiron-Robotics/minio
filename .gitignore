@@ -53,3 +53,9 @@ s3-check-md5
 s3-verify
 xattr
 xl-meta
+
+# Gridiron: deploy secrets (deploy/.env.example is the tracked template).
+deploy/.env
+
+# Gridiron: locally-built MCP sidecar binary (built into the image, never committed).
+mcp/minio-mcp

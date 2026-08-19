@@ -22,26 +22,75 @@ Everything Gridiron-specific lives in two added directories beside the engine:
 
 ## Security (matches the other modules)
 - **Caller gate**: `Authorization: Bearer` verified constant-time against
-  `MCP_AUTH_TOKEN` (presence-only when unset — never open). `HEAD /` exempt.
+  `MCP_AUTH_TOKEN`, which is **required** — unset, the sidecar refuses to boot
+  (exit 78) and compose refuses to start. It must also be a *real* secret:
+  compose only enforces **non-empty**, so the sidecar itself also refuses a
+  placeholder (`change_me…`, `changeme`, `secret`, `your-…`) or anything under 16
+  characters. `MINIO_MCP_ALLOW_INSECURE=1` is a local-dev-only escape that boots a
+  **deny-all** surface (every `/tools` and `/invoke` call is 401). `HEAD /` exempt
+  so gateways probe tokenlessly.
 - **Tenant isolation is structural**: tools take a `module`, never a raw bucket;
   the sidecar derives `bucket = t-<tenant>-<module>` from the authoritative
-  `X-Tenant-Id` header and sanitizes both segments, so a caller can **never**
-  name another tenant's bucket. `list_buckets` only returns `t-<tenant>-*`.
-- **Idempotency**: `Idempotency-Key` header → per-tenant replay of mutating tools.
+  `X-Tenant-Id` header. The derivation must be **injective** to isolate anything:
+  a tenant slug legitimately contains dashes (`gridiron-robotics`), so the
+  caller-supplied **module may not** — `[a-z0-9]+` only. Otherwise tenant `acme`
+  asking for module `hr-payroll` lands exactly on tenant `acme-hr`'s `payroll`
+  bucket. Segments are **validated, not rewritten** (rewriting mapped `acme_hr`
+  onto `acme-hr`, merging two tenants) and over-long ids are rejected, not
+  truncated. `list_buckets` returns only buckets whose remainder after
+  `t-<tenant>-` contains no dash, so a sibling tenant's inventory
+  (`t-acme-hr-payroll` seen by tenant `acme`) stays hidden. Object keys reject
+  `.`/`..`/absolute segments, so a presigned URL cannot be normalized by a browser
+  into a path other than the one that was signed.
+- **Idempotency**: `Idempotency-Key` header → per-tenant replay. The cache key is
+  (tenant, key, fingerprint of tool+arguments): a reused key on a *different* call
+  executes instead of returning the earlier call's envelope — keyed on the header
+  alone, a reused key made a `delete_object` report success and never run. The
+  cache is bounded (oldest-evicted past 5000 entries, so a caller-supplied key
+  cannot exhaust memory) and **in-memory only** — it does not survive a sidecar
+  restart, so a brain retry after a bounce may re-execute.
 - **Single login**: MinIO's native OIDC federation points at the `erp` realm
   (console + STS delegate to Keycloak) — config, not code (`MINIO_OIDC_*`).
 - **Encryption at rest**: SSE-KMS via a KES endpoint (`MINIO_KMS_KES_*`).
 - **Per-module service accounts** with policies scoped to their buckets
-  (`deploy/bootstrap.sh`, `deploy/policies/`). The image tag is **pinned**.
+  (`deploy/bootstrap.sh`, `deploy/policies/`). **Image tags are pinned** — the
+  engine images by release tag, the sidecar by a required `MINIO_MCP_IMAGE_TAG`
+  (compose refuses to start without it), and the sidecar's Dockerfile base images
+  by digest — no floating `:latest` on the infra path.
+- **Known gaps (not fixed here, do not assume otherwise)**:
+  1. `X-Tenant-Id` is *trusted*, not proven. The sidecar confines a caller to the
+     tenant the header names; it does not verify that the caller is that tenant.
+     Anyone holding the single shared bearer can set any tenant. Real isolation
+     between callers needs a per-tenant token or a Keycloak claim — not built.
+  2. `deploy/policies/tenant-scoped.json.tmpl` grants `t-${TENANT}-*` on the
+     **direct-S3** path, and that wildcard still matches a longer tenant's
+     buckets (`t-acme-*` covers `t-acme-hr-payroll`). S3 policy wildcards cannot
+     express "no dash", so render this template with one explicit
+     `arn:aws:s3:::t-<tenant>-<module>` per provisioned module instead of the
+     wildcard. The MCP path is not affected (it derives names in code).
+  3. The replay cache is per-process and in-memory; two sidecar replicas behind
+     one gateway do not share idempotency state.
+- **Self-heal rail**: when `OTEL_EXPORTER_OTLP_ENDPOINT` is set, a `>=500` storage
+  failure ships a `level=error` record to OpenObserve under
+  `service.name=minio-mcp`, firing the estate self-heal alert. Caller mistakes
+  (4xx) do not page. Optional — unset = a silent no-op, so telemetry is never a
+  boot dependency (`mcp/selfheal.go`, `OTEL_*` in `deploy/.env.example`).
 
 ## Boot it (on the shared network)
 ```bash
-cd deploy && cp .env.example .env    # set MINIO_ROOT_PASSWORD, MCP_MINIO_SECRET_KEY, MINIO_MCP_TOKEN
+cd deploy && cp .env.example .env    # set MINIO_ROOT_PASSWORD, MCP_MINIO_SECRET_KEY, MINIO_MCP_TOKEN, MINIO_MCP_IMAGE_TAG
 docker network create erp_shared_network 2>/dev/null || true
 docker compose up -d                 # minio + bootstrap (buckets/policies) + minio-mcp
 docker compose exec minio mc ls gr   # buckets exist
 curl -s -H "Authorization: Bearer $MINIO_MCP_TOKEN" http://localhost:8090/tools?server=minio | head
 ```
+
+## Gates
+- **Offline**: `STRICT=1 ./repo-gates/verify.sh` — go fmt/vet/test the sidecar,
+  version-pinning, `docker compose config`, shell lint. Needs no live stack; runs
+  in CI on any change under `mcp/**`, `deploy/**`, `repo-gates/**`.
+- **Live**: `deploy/smoke.sh` — probes the already-running stack by container name
+  on `erp_shared_network`. Both must be green.
 
 ## How a module uses it
 - **Object I/O**: talk S3 directly to `minio:9000` with the module's scoped
