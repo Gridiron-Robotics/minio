@@ -148,5 +148,27 @@ done
 (( sh_checked == 0 )) && skip "no shell scripts found to check"
 have shellcheck || note "install shellcheck for deeper analysis (bash -n only checks syntax)"
 
+# ── gate: bootstrap behaviour (real script, stub `mc` on PATH) ───────────────
+# deploy/bootstrap.sh was shellcheck-only — syntax, never behaviour. Its two
+# load-bearing claims are offline-testable without MinIO: it must survive being
+# run twice (its own header promises "safe to re-run"), and it must REFUSE an
+# invalid tenant/module rather than provision a bucket the sidecar can never
+# safely address. bootstrap_test.sh runs the real, unmodified script against a
+# stub `mc` and asserts both. It proves the SCRIPT's logic, not MinIO's or real
+# mc's — the live path remains deploy/smoke.sh, which needs Docker.
+section "bootstrap — behavioural (deploy/bootstrap_test.sh, stub mc)"
+BOOT_TEST="deploy/bootstrap_test.sh"
+if [[ -f "${BOOT_TEST}" ]]; then
+  if bash "${BOOT_TEST}" >.gate-bootstrap.log 2>&1; then
+    pass "bootstrap.sh: idempotent re-run + refuses invalid tenant/module"
+  else
+    fail "bootstrap.sh behavioural test"
+    note "$(grep -E '^\s+FAIL|passed, ' .gate-bootstrap.log | tail -n 12)"
+  fi
+  rm -f .gate-bootstrap.log
+else
+  fail "missing ${BOOT_TEST} (behavioural coverage for bootstrap.sh was deleted)"
+fi
+
 finish "minio overlay verify"
 exit $?
