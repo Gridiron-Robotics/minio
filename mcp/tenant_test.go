@@ -174,7 +174,10 @@ func TestTraversalKeysRejected(t *testing.T) {
 		w.Header().Set("ETag", `"x"`)
 		w.WriteHeader(http.StatusOK)
 	})
-	for _, bad := range []string{"../t-globex-orders/steal.txt", "a/../../x", "/abs.txt", "", "a//b"} {
+	// "a/b/" is here because the shared guard now takes an allowTrailingSlash
+	// flag: a prefix may end in "/", a key may not (that is a trailing empty
+	// segment). Flipping that flag for keys must not go unnoticed.
+	for _, bad := range []string{"../t-globex-orders/steal.txt", "a/../../x", "/abs.txt", "", "a//b", "a/b/"} {
 		for _, tool := range []string{"put_object", "delete_object", "stat_object", "presign_get", "presign_put"} {
 			body := `{"tool":"` + tool + `","arguments":{"module":"orders","key":` + jsonStr(bad) + `,"content_base64":"aGk="}}`
 			code, _ := invokeResult(t, s, "acme", body)
